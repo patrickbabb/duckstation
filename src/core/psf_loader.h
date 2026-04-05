@@ -1,16 +1,10 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #pragma once
-
 #include "types.h"
-
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
-
-class Error;
 
 namespace PSFLoader {
 
@@ -43,7 +37,7 @@ public:
   int GetTagInt(const char* tag_name, int default_value) const;
   float GetTagFloat(const char* tag_name, float default_value) const;
 
-  bool Load(const char* path, Error* error);
+  bool Load(const char* path);
 
 private:
   enum : u32
@@ -56,6 +50,6 @@ private:
   DiscRegion m_region = DiscRegion::Other;
 };
 
-bool Load(const std::string& path, Error* error);
+bool Load(const char* path);
 
 } // namespace PSFLoader

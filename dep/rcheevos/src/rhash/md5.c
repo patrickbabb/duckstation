@@ -52,7 +52,6 @@
  */
 
 #include "md5.h"
-#include <stddef.h>
 #include <string.h>
 
 #undef BYTE_ORDER	/* 1 = big-endian, -1 = little-endian, 0 = unknown */
@@ -162,7 +161,7 @@ md5_process(md5_state_t *pms, const md5_byte_t *data /*[64]*/)
 	     * On little-endian machines, we can process properly aligned
 	     * data without copying it.
 	     */
-	    if (!((ptrdiff_t)data & 3)) {
+	    if (!((data - (const md5_byte_t *)0) & 3)) {
 		/* data are properly aligned */
 		X = (const md5_word_t *)data;
 	    } else {

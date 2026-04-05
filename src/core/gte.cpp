@@ -1,36 +1,15 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #include "gte.h"
-#include "cpu_core.h"
-#include "cpu_core_private.h"
-#include "cpu_pgxp.h"
-#include "host.h"
-#include "settings.h"
-
-#include "util/state_wrapper.h"
-
 #include "common/assert.h"
 #include "common/bitutils.h"
-#include "common/gsvector.h"
-#include "common/log.h"
-#include "common/timer.h"
-
-#include "imgui.h"
-
+#include "common/state_wrapper.h"
+#include "cpu_core.h"
+#include "host_display.h"
+#include "host_interface.h"
+#include "pgxp.h"
+#include "settings.h"
 #include <algorithm>
 #include <array>
-#include <atomic>
-#include <numbers>
 #include <numeric>
-
-LOG_CHANNEL(CPU);
-
-// Freecam is disabled on Android because there's no windowed UI for it.
-// And because users can't be trusted to not crash games and complain.
-#ifndef __ANDROID__
-#define ENABLE_FREECAM 1
-#endif
 
 namespace GTE {
 
@@ -43,58 +22,10 @@ static constexpr s32 IR0_MAX_VALUE = 0x1000;
 static constexpr s32 IR123_MIN_VALUE = -(INT64_C(1) << 15);
 static constexpr s32 IR123_MAX_VALUE = (INT64_C(1) << 15) - 1;
 
-static constexpr float FREECAM_MIN_TRANSLATION = -40000.0f;
-static constexpr float FREECAM_MAX_TRANSLATION = 40000.0f;
-static constexpr float FREECAM_MIN_ROTATION = -360.0f;
-static constexpr float FREECAM_MAX_ROTATION = 360.0f;
-static constexpr float FREECAM_DEFAULT_MOVE_SPEED = 4096.0f;
-static constexpr float FREECAM_MAX_MOVE_SPEED = 65536.0f;
-static constexpr float FREECAM_DEFAULT_TURN_SPEED = 30.0f;
-static constexpr float FREECAM_MAX_TURN_SPEED = 360.0f;
-
-enum class GTEAspectRatio : u8
-{
-  None,
-  R16_9,
-  R19_9,
-  R20_9,
-  Custom,
-  Count
-};
-
-namespace {
-
-struct ALIGN_TO_CACHE_LINE Config
-{
-  GTEAspectRatio aspect_ratio = GTEAspectRatio::None;
-  u32 custom_aspect_ratio_numerator = 0;
-  u32 custom_aspect_ratio_denominator = 0;
-  float custom_aspect_ratio_f = 1.0f;
-
-#ifdef ENABLE_FREECAM
-
-  Timer::Value freecam_update_time = 0;
-  std::atomic_bool freecam_transform_changed{false};
-  bool freecam_enabled = false;
-  bool freecam_active = false;
-  bool freecam_reverse_transform_order = false;
-
-  float freecam_move_speed = FREECAM_DEFAULT_MOVE_SPEED;
-  float freecam_turn_speed = FREECAM_DEFAULT_TURN_SPEED;
-  GSVector4 freecam_move = GSVector4::cxpr(0.0f);
-  GSVector4 freecam_turn = GSVector4::cxpr(0.0f);
-
-  GSVector4 freecam_rotation = GSVector4::cxpr(0.0f);
-  GSVector4 freecam_translation = GSVector4::cxpr(0.0f);
-
-  ALIGN_TO_CACHE_LINE GSMatrix4x4 freecam_matrix = GSMatrix4x4::Identity();
-  GSMatrix4x4 freecam_inverted_rotation_matrix = GSMatrix4x4::Identity();
-#endif
-};
-
-} // namespace
-
-static constinit Config s_config;
+static DisplayAspectRatio s_aspect_ratio = DisplayAspectRatio::R4_3;
+static u32 s_custom_aspect_ratio_numerator;
+static u32 s_custom_aspect_ratio_denominator;
+static float s_custom_aspect_ratio_f;
 
 #define REGS CPU::g_state.gte_regs
 
@@ -223,108 +154,73 @@ ALWAYS_INLINE static u32 TruncateRGB(s32 value)
   return static_cast<u32>(value);
 }
 
-static void SetOTZ(s32 value);
-static void PushSXY(s32 x, s32 y);
-static void PushSZ(s32 value);
-static void PushRGBFromMAC();
-static u32 UNRDivide(u32 lhs, u32 rhs);
-
-static void MulMatVec(const s16* M_, const s16 Vx, const s16 Vy, const s16 Vz, u8 shift, bool lm);
-static void MulMatVec(const s16* M_, const s32 T[3], const s16 Vx, const s16 Vy, const s16 Vz, u8 shift, bool lm);
-static void MulMatVecBuggy(const s16* M_, const s32 T[3], const s16 Vx, const s16 Vy, const s16 Vz, u8 shift, bool lm);
-
-static void InterpolateColor(s64 in_MAC1, s64 in_MAC2, s64 in_MAC3, u8 shift, bool lm);
-static void RTPS(const s16 V[3], u8 shift, bool lm, bool last);
-static void NCS(const s16 V[3], u8 shift, bool lm);
-static void NCCS(const s16 V[3], u8 shift, bool lm);
-static void NCDS(const s16 V[3], u8 shift, bool lm);
-static void DPCS(const u8 color[3], u8 shift, bool lm);
-
-#ifdef ENABLE_FREECAM
-static void ApplyFreecam(s64& x, s64& y, s64& z);
-#endif
-
-static void Execute_MVMVA(Instruction inst);
-static void Execute_SQR(Instruction inst);
-static void Execute_OP(Instruction inst);
-static void Execute_RTPS(Instruction inst);
-static void Execute_RTPT(Instruction inst);
-static void Execute_NCLIP(Instruction inst);
-static void Execute_NCLIP_PGXP(Instruction inst);
-static void Execute_AVSZ3(Instruction inst);
-static void Execute_AVSZ4(Instruction inst);
-static void Execute_NCS(Instruction inst);
-static void Execute_NCT(Instruction inst);
-static void Execute_NCCS(Instruction inst);
-static void Execute_NCCT(Instruction inst);
-static void Execute_NCDS(Instruction inst);
-static void Execute_NCDT(Instruction inst);
-static void Execute_CC(Instruction inst);
-static void Execute_CDP(Instruction inst);
-static void Execute_DPCS(Instruction inst);
-static void Execute_DPCT(Instruction inst);
-static void Execute_DCPL(Instruction inst);
-static void Execute_INTPL(Instruction inst);
-static void Execute_GPL(Instruction inst);
-static void Execute_GPF(Instruction inst);
-
-} // namespace GTE
-
-void GTE::Reset()
+void Initialize()
 {
-  std::memset(&REGS, 0, sizeof(REGS));
-  SetFreecamEnabled(false);
-  ResetFreecam();
+  UpdateAspectRatio();
+  Reset();
 }
 
-bool GTE::DoState(StateWrapper& sw)
+void Reset()
+{
+  std::memset(&REGS, 0, sizeof(REGS));
+}
+
+bool DoState(StateWrapper& sw)
 {
   sw.DoArray(REGS.r32, NUM_DATA_REGS + NUM_CONTROL_REGS);
   return !sw.HasError();
 }
 
-void GTE::SetAspectRatio(const DisplayAspectRatio& aspect)
+void UpdateAspectRatio()
 {
-  static constexpr const std::pair<DisplayAspectRatio, GTEAspectRatio> aspect_ratio_map[] = {
-    {DisplayAspectRatio::Auto(), GTEAspectRatio::None}, {DisplayAspectRatio{4, 3}, GTEAspectRatio::None},
-    {DisplayAspectRatio{16, 9}, GTEAspectRatio::R16_9}, {DisplayAspectRatio{19, 9}, GTEAspectRatio::R19_9},
-    {DisplayAspectRatio{20, 9}, GTEAspectRatio::R20_9},
-  };
-
-  s_config.aspect_ratio = GTEAspectRatio::Custom;
-
-  for (const auto& [display_ar, gte_ar] : aspect_ratio_map)
+  if (!g_settings.gpu_widescreen_hack)
   {
-    if (aspect == display_ar)
+    s_aspect_ratio = DisplayAspectRatio::R4_3;
+    return;
+  }
+
+  s_aspect_ratio = g_settings.display_aspect_ratio;
+
+  u32 num, denom;
+  switch (s_aspect_ratio)
+  {
+    case DisplayAspectRatio::MatchWindow:
     {
-      s_config.aspect_ratio = gte_ar;
-      break;
+      const HostDisplay* display = g_host_interface->GetDisplay();
+      if (!display)
+      {
+        s_aspect_ratio = DisplayAspectRatio::R4_3;
+        return;
+      }
+
+      num = display->GetWindowWidth();
+      denom = display->GetWindowHeight();
     }
-  }
+    break;
 
-  if (s_config.aspect_ratio == GTEAspectRatio::None)
-  {
-    DEV_LOG("GTE aspect ratio correction is disabled.");
-    return;
-  }
+    case DisplayAspectRatio::Custom:
+    {
+      num = g_settings.display_aspect_ratio_custom_numerator;
+      denom = g_settings.display_aspect_ratio_custom_denominator;
+    }
+    break;
 
-  DEV_COLOR_LOG(StrongOrange, "GTE aspect ratio correction set to {}:{}", aspect.numerator, aspect.denominator);
-  if (s_config.aspect_ratio != GTEAspectRatio::Custom)
-    return;
+    default:
+      return;
+  }
 
   // (4 / 3) / (num / denom) => gcd((4 * denom) / (3 * num))
-  const u32 x = 4u * static_cast<u32>(aspect.denominator);
-  const u32 y = 3u * static_cast<u32>(aspect.numerator);
+  const u32 x = 4u * denom;
+  const u32 y = 3u * num;
   const u32 gcd = std::gcd(x, y);
 
-  s_config.custom_aspect_ratio_numerator = x / gcd;
-  s_config.custom_aspect_ratio_denominator = y / gcd;
+  s_custom_aspect_ratio_numerator = x / gcd;
+  s_custom_aspect_ratio_denominator = y / gcd;
 
-  s_config.custom_aspect_ratio_f =
-    static_cast<float>((4.0 / 3.0) / (static_cast<double>(aspect.numerator) / static_cast<double>(aspect.denominator)));
+  s_custom_aspect_ratio_f = static_cast<float>((4.0 / 3.0) / (static_cast<double>(num) / static_cast<double>(denom)));
 }
 
-u32 GTE::ReadRegister(u32 index)
+u32 ReadRegister(u32 index)
 {
   DebugAssert(index < countof(REGS.r32));
 
@@ -351,7 +247,7 @@ u32 GTE::ReadRegister(u32 index)
   }
 }
 
-void GTE::WriteRegister(u32 index, u32 value)
+void WriteRegister(u32 index, u32 value)
 {
 #if 0
   if (index < 32)
@@ -446,12 +342,12 @@ void GTE::WriteRegister(u32 index, u32 value)
   }
 }
 
-u32* GTE::GetRegisterPtr(u32 index)
+u32* GetRegisterPtr(u32 index)
 {
   return &REGS.r32[index];
 }
 
-ALWAYS_INLINE void GTE::SetOTZ(s32 value)
+ALWAYS_INLINE static void SetOTZ(s32 value)
 {
   if (value < 0)
   {
@@ -467,7 +363,7 @@ ALWAYS_INLINE void GTE::SetOTZ(s32 value)
   REGS.dr32[7] = static_cast<u32>(value);
 }
 
-ALWAYS_INLINE void GTE::PushSXY(s32 x, s32 y)
+ALWAYS_INLINE static void PushSXY(s32 x, s32 y)
 {
   if (x < -1024)
   {
@@ -496,7 +392,7 @@ ALWAYS_INLINE void GTE::PushSXY(s32 x, s32 y)
   REGS.dr32[14] = (static_cast<u32>(x) & 0xFFFFu) | (static_cast<u32>(y) << 16);
 }
 
-ALWAYS_INLINE void GTE::PushSZ(s32 value)
+ALWAYS_INLINE static void PushSZ(s32 value)
 {
   if (value < 0)
   {
@@ -515,7 +411,7 @@ ALWAYS_INLINE void GTE::PushSZ(s32 value)
   REGS.dr32[19] = static_cast<u32>(value); // SZ3 <- value
 }
 
-ALWAYS_INLINE void GTE::PushRGBFromMAC()
+static void PushRGBFromMAC()
 {
   // Note: SHR 4 used instead of /16 as the results are different.
   const u32 r = TruncateRGB<0>(static_cast<u32>(REGS.MAC1 >> 4));
@@ -528,7 +424,7 @@ ALWAYS_INLINE void GTE::PushRGBFromMAC()
   REGS.dr32[22] = r | (g << 8) | (b << 16) | (c << 24); // RGB2 <- Value
 }
 
-ALWAYS_INLINE u32 GTE::UNRDivide(u32 lhs, u32 rhs)
+ALWAYS_INLINE static u32 UNRDivide(u32 lhs, u32 rhs)
 {
   if (rhs * 2 <= lhs)
   {
@@ -572,12 +468,11 @@ ALWAYS_INLINE u32 GTE::UNRDivide(u32 lhs, u32 rhs)
   return std::min<u32>(0x1FFFF, result);
 }
 
-void GTE::MulMatVec(const s16* M_, const s16 Vx, const s16 Vy, const s16 Vz, u8 shift, bool lm)
+static void MulMatVec(const s16 M[3][3], const s16 Vx, const s16 Vy, const s16 Vz, u8 shift, bool lm)
 {
-#define M(i, j) M_[((i) * 3) + (j)]
 #define dot3(i)                                                                                                        \
-  TruncateAndSetMACAndIR<i + 1>(SignExtendMACResult<i + 1>((s64(M(i, 0)) * s64(Vx)) + (s64(M(i, 1)) * s64(Vy))) +      \
-                                  (s64(M(i, 2)) * s64(Vz)),                                                            \
+  TruncateAndSetMACAndIR<i + 1>(SignExtendMACResult<i + 1>((s64(M[i][0]) * s64(Vx)) + (s64(M[i][1]) * s64(Vy))) +      \
+                                  (s64(M[i][2]) * s64(Vz)),                                                            \
                                 shift, lm)
 
   dot3(0);
@@ -585,17 +480,15 @@ void GTE::MulMatVec(const s16* M_, const s16 Vx, const s16 Vy, const s16 Vz, u8 
   dot3(2);
 
 #undef dot3
-#undef M
 }
 
-void GTE::MulMatVec(const s16* M_, const s32 T[3], const s16 Vx, const s16 Vy, const s16 Vz, u8 shift, bool lm)
+static void MulMatVec(const s16 M[3][3], const s32 T[3], const s16 Vx, const s16 Vy, const s16 Vz, u8 shift, bool lm)
 {
-#define M(i, j) M_[((i) * 3) + (j)]
 #define dot3(i)                                                                                                        \
   TruncateAndSetMACAndIR<i + 1>(                                                                                       \
-    SignExtendMACResult<i + 1>(SignExtendMACResult<i + 1>((s64(T[i]) << 12) + (s64(M(i, 0)) * s64(Vx))) +              \
-                               (s64(M(i, 1)) * s64(Vy))) +                                                             \
-      (s64(M(i, 2)) * s64(Vz)),                                                                                        \
+    SignExtendMACResult<i + 1>(SignExtendMACResult<i + 1>((s64(T[i]) << 12) + (s64(M[i][0]) * s64(Vx))) +              \
+                               (s64(M[i][1]) * s64(Vy))) +                                                             \
+      (s64(M[i][2]) * s64(Vz)),                                                                                        \
     shift, lm)
 
   dot3(0);
@@ -603,20 +496,19 @@ void GTE::MulMatVec(const s16* M_, const s32 T[3], const s16 Vx, const s16 Vy, c
   dot3(2);
 
 #undef dot3
-#undef M
 }
 
-void GTE::MulMatVecBuggy(const s16* M_, const s32 T[3], const s16 Vx, const s16 Vy, const s16 Vz, u8 shift, bool lm)
+static void MulMatVecBuggy(const s16 M[3][3], const s32 T[3], const s16 Vx, const s16 Vy, const s16 Vz, u8 shift,
+                           bool lm)
 {
-#define M(i, j) M_[((i) * 3) + (j)]
 #define dot3(i)                                                                                                        \
   do                                                                                                                   \
   {                                                                                                                    \
     TruncateAndSetIR<i + 1>(static_cast<s32>(SignExtendMACResult<i + 1>(SignExtendMACResult<i + 1>(                    \
-                                               (s64(T[i]) << 12) + (s64(M(i, 0)) * s64(Vx)))) >>                       \
+                                               (s64(T[i]) << 12) + (s64(M[i][0]) * s64(Vx)))) >>                       \
                                              shift),                                                                   \
                             false);                                                                                    \
-    TruncateAndSetMACAndIR<i + 1>(SignExtendMACResult<i + 1>((s64(M(i, 1)) * s64(Vy))) + (s64(M(i, 2)) * s64(Vz)),     \
+    TruncateAndSetMACAndIR<i + 1>(SignExtendMACResult<i + 1>((s64(M[i][1]) * s64(Vy))) + (s64(M[i][2]) * s64(Vz)),     \
                                   shift, lm);                                                                          \
   } while (0)
 
@@ -625,55 +517,87 @@ void GTE::MulMatVecBuggy(const s16* M_, const s32 T[3], const s16 Vx, const s16 
   dot3(2);
 
 #undef dot3
-#undef M
 }
 
-void GTE::Execute_MVMVA(Instruction inst)
+static void Execute_MVMVA(Instruction inst)
 {
   REGS.FLAG.Clear();
 
-  static constexpr const s16* M_lookup[4] = {&REGS.RT[0][0], &REGS.LLM[0][0], &REGS.LCM[0][0], nullptr};
-  static constexpr const s16* V_lookup[4][3] = {
-    {&REGS.V0[0], &REGS.V0[1], &REGS.V0[2]},
-    {&REGS.V1[0], &REGS.V1[1], &REGS.V1[2]},
-    {&REGS.V2[0], &REGS.V2[1], &REGS.V2[2]},
-    {&REGS.IR1, &REGS.IR2, &REGS.IR3},
-  };
-  static constexpr const s32 zero_T[3] = {};
-  static constexpr const s32* T_lookup[4] = {REGS.TR, REGS.BK, REGS.FC, zero_T};
-
-  const s16* M = M_lookup[inst.mvmva_multiply_matrix];
-  const s16* const* const V = V_lookup[inst.mvmva_multiply_vector];
-  const s32* const T = T_lookup[inst.mvmva_translation_vector];
-  s16 buggy_M[3][3];
-
-  if (!M)
+  // TODO: Remove memcpy..
+  s16 M[3][3];
+  switch (inst.mvmva_multiply_matrix)
   {
-    // buggy
-    buggy_M[0][0] = -static_cast<s16>(ZeroExtend16(REGS.RGBC[0]) << 4);
-    buggy_M[0][1] = static_cast<s16>(ZeroExtend16(REGS.RGBC[0]) << 4);
-    buggy_M[0][2] = REGS.IR0;
-    buggy_M[1][0] = REGS.RT[0][2];
-    buggy_M[1][1] = REGS.RT[0][2];
-    buggy_M[1][2] = REGS.RT[0][2];
-    buggy_M[2][0] = REGS.RT[1][1];
-    buggy_M[2][1] = REGS.RT[1][1];
-    buggy_M[2][2] = REGS.RT[1][1];
-    M = &buggy_M[0][0];
+    case 0:
+      std::memcpy(M, REGS.RT, sizeof(s16) * 3 * 3);
+      break;
+    case 1:
+      std::memcpy(M, REGS.LLM, sizeof(s16) * 3 * 3);
+      break;
+    case 2:
+      std::memcpy(M, REGS.LCM, sizeof(s16) * 3 * 3);
+      break;
+    default:
+    {
+      // buggy
+      M[0][0] = -static_cast<s16>(ZeroExtend16(REGS.RGBC[0]) << 4);
+      M[0][1] = static_cast<s16>(ZeroExtend16(REGS.RGBC[0]) << 4);
+      M[0][2] = REGS.IR0;
+      M[1][0] = REGS.RT[0][2];
+      M[1][1] = REGS.RT[0][2];
+      M[1][2] = REGS.RT[0][2];
+      M[2][0] = REGS.RT[1][1];
+      M[2][1] = REGS.RT[1][1];
+      M[2][2] = REGS.RT[1][1];
+    }
+    break;
   }
 
-  const s16 Vx = *V[0];
-  const s16 Vy = *V[1];
-  const s16 Vz = *V[2];
-  if (inst.mvmva_translation_vector != 2)
-    MulMatVec(M, T, Vx, Vy, Vz, inst.GetShift(), inst.lm);
-  else
-    MulMatVecBuggy(M, T, Vx, Vy, Vz, inst.GetShift(), inst.lm);
+  s16 Vx, Vy, Vz;
+  switch (inst.mvmva_multiply_vector)
+  {
+    case 0:
+      Vx = REGS.V0[0];
+      Vy = REGS.V0[1];
+      Vz = REGS.V0[2];
+      break;
+    case 1:
+      Vx = REGS.V1[0];
+      Vy = REGS.V1[1];
+      Vz = REGS.V1[2];
+      break;
+    case 2:
+      Vx = REGS.V2[0];
+      Vy = REGS.V2[1];
+      Vz = REGS.V2[2];
+      break;
+    default:
+      Vx = REGS.IR1;
+      Vy = REGS.IR2;
+      Vz = REGS.IR3;
+      break;
+  }
+
+  static const s32 zero_T[3] = {};
+  switch (inst.mvmva_translation_vector)
+  {
+    case 0:
+      MulMatVec(M, REGS.TR, Vx, Vy, Vz, inst.GetShift(), inst.lm);
+      break;
+    case 1:
+      MulMatVec(M, REGS.BK, Vx, Vy, Vz, inst.GetShift(), inst.lm);
+      break;
+    case 2:
+      MulMatVecBuggy(M, REGS.FC, Vx, Vy, Vz, inst.GetShift(), inst.lm);
+      break;
+    default:
+      MulMatVec(M, zero_T, Vx, Vy, Vz, inst.GetShift(), inst.lm);
+      break;
+  }
 
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_SQR(Instruction inst)
+static void Execute_SQR(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -691,7 +615,7 @@ void GTE::Execute_SQR(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_OP(Instruction inst)
+static void Execute_OP(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -714,7 +638,7 @@ void GTE::Execute_OP(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::RTPS(const s16 V[3], u8 shift, bool lm, bool last)
+static void RTPS(const s16 V[3], u8 shift, bool lm, bool last)
 {
 #define dot3(i)                                                                                                        \
   SignExtendMACResult<i + 1>(SignExtendMACResult<i + 1>((s64(REGS.TR[i]) << 12) + (s64(REGS.RT[i][0]) * s64(V[0]))) +  \
@@ -724,15 +648,9 @@ void GTE::RTPS(const s16 V[3], u8 shift, bool lm, bool last)
   // IR1 = MAC1 = (TRX*1000h + RT11*VX0 + RT12*VY0 + RT13*VZ0) SAR (sf*12)
   // IR2 = MAC2 = (TRY*1000h + RT21*VX0 + RT22*VY0 + RT23*VZ0) SAR (sf*12)
   // IR3 = MAC3 = (TRZ*1000h + RT31*VX0 + RT32*VY0 + RT33*VZ0) SAR (sf*12)
-  s64 x = dot3(0);
-  s64 y = dot3(1);
-  s64 z = dot3(2);
-
-#ifdef ENABLE_FREECAM
-  if (s_config.freecam_active)
-    ApplyFreecam(x, y, z);
-#endif
-
+  const s64 x = dot3(0);
+  const s64 y = dot3(1);
+  const s64 z = dot3(2);
   TruncateAndSetMAC<1>(x, shift);
   TruncateAndSetMAC<2>(y, shift);
   TruncateAndSetMAC<3>(z, shift);
@@ -754,27 +672,30 @@ void GTE::RTPS(const s16 V[3], u8 shift, bool lm, bool last)
   const s64 result = static_cast<s64>(ZeroExtend64(UNRDivide(REGS.H, REGS.SZ3)));
 
   s64 Sx;
-  switch (s_config.aspect_ratio)
+  switch (s_aspect_ratio)
   {
-    case GTEAspectRatio::R16_9:
+    case DisplayAspectRatio::R16_9:
       Sx = ((((s64(result) * s64(REGS.IR1)) * s64(3)) / s64(4)) + s64(REGS.OFX));
       break;
 
-    case GTEAspectRatio::R19_9:
+    case DisplayAspectRatio::R19_9:
       Sx = ((((s64(result) * s64(REGS.IR1)) * s64(12)) / s64(19)) + s64(REGS.OFX));
       break;
 
-    case GTEAspectRatio::R20_9:
+    case DisplayAspectRatio::R20_9:
       Sx = ((((s64(result) * s64(REGS.IR1)) * s64(3)) / s64(5)) + s64(REGS.OFX));
       break;
 
-    case GTEAspectRatio::Custom:
-      Sx = ((((s64(result) * s64(REGS.IR1)) * s64(s_config.custom_aspect_ratio_numerator)) /
-             s64(s_config.custom_aspect_ratio_denominator)) +
+    case DisplayAspectRatio::Custom:
+    case DisplayAspectRatio::MatchWindow:
+      Sx = ((((s64(result) * s64(REGS.IR1)) * s64(s_custom_aspect_ratio_numerator)) /
+             s64(s_custom_aspect_ratio_denominator)) +
             s64(REGS.OFX));
       break;
 
-    case GTEAspectRatio::None:
+    case DisplayAspectRatio::Auto:
+    case DisplayAspectRatio::R4_3:
+    case DisplayAspectRatio::PAR1_1:
     default:
       Sx = (s64(result) * s64(REGS.IR1) + s64(REGS.OFX));
       break;
@@ -791,40 +712,9 @@ void GTE::RTPS(const s16 V[3], u8 shift, bool lm, bool last)
 
     if (g_settings.gpu_pgxp_preserve_proj_fp)
     {
-      float precise_x, precise_y, precise_z;
-      if (shift > 0)
-      {
-        // TODO: This isn't handling the sign extended cases.
-        constexpr GSVector4 unscale = GSVector4::cxpr(1.0f / 4096.0f);
-        const GSVector4 FV = GSVector4(GSVector4i::loadl<false>(V).s16to32()).insert32<3>(0.0f);
-        const GSVector4 RT0 = GSVector4(GSVector4i::loadl<false>(REGS.RT[0]).s16to32()) * unscale;
-        const GSVector4 RT1 = GSVector4(GSVector4i::loadl<false>(REGS.RT[1]).s16to32()) * unscale;
-        const GSVector4 RT2 = GSVector4(GSVector4i::loadl<false>(REGS.RT[2]).s16to32()) * unscale;
-
-        precise_x = RT0.dot(FV) + static_cast<float>(REGS.TR[0]);
-        precise_y = RT1.dot(FV) + static_cast<float>(REGS.TR[1]);
-        precise_z = RT2.dot(FV) + static_cast<float>(REGS.TR[2]);
-
-#ifdef ENABLE_FREECAM
-        if (s_config.freecam_active)
-        {
-          const GSVector4 offset_pos = s_config.freecam_matrix * GSVector4(precise_x, precise_y, precise_z, 1.0f);
-          precise_x = offset_pos.extract32<0>();
-          precise_y = offset_pos.extract32<1>();
-          precise_z = offset_pos.extract32<2>();
-        }
-#endif
-      }
-      else
-      {
-        precise_x = static_cast<float>(x) / (static_cast<float>(1 << shift));
-        precise_y = static_cast<float>(y) / (static_cast<float>(1 << shift));
-        precise_z = static_cast<float>(z) / 4096.0f;
-      }
-
-      precise_sz3 = precise_z;
-      precise_ir1 = precise_x;
-      precise_ir2 = precise_y;
+      precise_sz3 = float(z) / 4096.0f;
+      precise_ir1 = float(x) / (static_cast<float>(1 << shift));
+      precise_ir2 = float(y) / (static_cast<float>(1 << shift));
       if (lm)
       {
         precise_ir1 = std::clamp(precise_ir1, float(IR123_MIN_VALUE), float(IR123_MAX_VALUE));
@@ -850,25 +740,28 @@ void GTE::RTPS(const s16 V[3], u8 shift, bool lm, bool last)
     const float fofy = float(REGS.OFY) / float(1 << 16);
     float precise_x = precise_ir1 * precise_h_div_sz;
 
-    switch (s_config.aspect_ratio)
+    switch (s_aspect_ratio)
     {
-      case GTEAspectRatio::Custom:
-        precise_x = precise_x * s_config.custom_aspect_ratio_f;
+      case DisplayAspectRatio::MatchWindow:
+      case DisplayAspectRatio::Custom:
+        precise_x = precise_x * s_custom_aspect_ratio_f;
         break;
 
-      case GTEAspectRatio::R16_9:
+      case DisplayAspectRatio::R16_9:
         precise_x = (precise_x * 3.0f) / 4.0f;
         break;
 
-      case GTEAspectRatio::R19_9:
+      case DisplayAspectRatio::R19_9:
         precise_x = (precise_x * 12.0f) / 19.0f;
         break;
 
-      case GTEAspectRatio::R20_9:
+      case DisplayAspectRatio::R20_9:
         precise_x = (precise_x * 3.0f) / 5.0f;
         break;
 
-      case GTEAspectRatio::None:
+      case DisplayAspectRatio::Auto:
+      case DisplayAspectRatio::R4_3:
+      case DisplayAspectRatio::PAR1_1:
       default:
         break;
     }
@@ -879,7 +772,7 @@ void GTE::RTPS(const s16 V[3], u8 shift, bool lm, bool last)
 
     precise_x = std::clamp<float>(precise_x, -1024.0f, 1023.0f);
     precise_y = std::clamp<float>(precise_y, -1024.0f, 1023.0f);
-    CPU::PGXP::GTE_RTPS(precise_x, precise_y, precise_z, REGS.dr32[14]);
+    PGXP::GTE_PushSXYZ2f(precise_x, precise_y, precise_z, REGS.dr32[14]);
   }
 
   if (last)
@@ -891,14 +784,14 @@ void GTE::RTPS(const s16 V[3], u8 shift, bool lm, bool last)
   }
 }
 
-void GTE::Execute_RTPS(Instruction inst)
+static void Execute_RTPS(Instruction inst)
 {
   REGS.FLAG.Clear();
   RTPS(REGS.V0, inst.GetShift(), inst.lm, true);
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_RTPT(Instruction inst)
+static void Execute_RTPT(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -912,7 +805,7 @@ void GTE::Execute_RTPT(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_NCLIP(Instruction inst)
+static void Execute_NCLIP(Instruction inst)
 {
   // MAC0 =   SX0*SY1 + SX1*SY2 + SX2*SY0 - SX0*SY2 - SX1*SY0 - SX2*SY1
   REGS.FLAG.Clear();
@@ -925,12 +818,12 @@ void GTE::Execute_NCLIP(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_NCLIP_PGXP(Instruction inst)
+static void Execute_NCLIP_PGXP(Instruction inst)
 {
-  if (CPU::PGXP::GTE_HasPreciseVertices(REGS.dr32[12], REGS.dr32[13], REGS.dr32[14]))
+  if (PGXP::GTE_NCLIP_valid(REGS.dr32[12], REGS.dr32[13], REGS.dr32[14]))
   {
     REGS.FLAG.Clear();
-    REGS.MAC0 = static_cast<s32>(CPU::PGXP::GTE_NCLIP());
+    REGS.MAC0 = static_cast<s32>(PGXP::GTE_NCLIP());
   }
   else
   {
@@ -938,7 +831,7 @@ void GTE::Execute_NCLIP_PGXP(Instruction inst)
   }
 }
 
-void GTE::Execute_AVSZ3(Instruction inst)
+static void Execute_AVSZ3(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -949,7 +842,7 @@ void GTE::Execute_AVSZ3(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_AVSZ4(Instruction inst)
+static void Execute_AVSZ4(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -960,7 +853,7 @@ void GTE::Execute_AVSZ4(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-ALWAYS_INLINE void GTE::InterpolateColor(s64 in_MAC1, s64 in_MAC2, s64 in_MAC3, u8 shift, bool lm)
+static ALWAYS_INLINE void InterpolateColor(s64 in_MAC1, s64 in_MAC2, s64 in_MAC3, u8 shift, bool lm)
 {
   // [MAC1,MAC2,MAC3] = MAC+(FC-MAC)*IR0
   //   [IR1,IR2,IR3] = (([RFC,GFC,BFC] SHL 12) - [MAC1,MAC2,MAC3]) SAR (sf*12)
@@ -975,19 +868,19 @@ ALWAYS_INLINE void GTE::InterpolateColor(s64 in_MAC1, s64 in_MAC2, s64 in_MAC3, 
   TruncateAndSetMACAndIR<3>(s64(s32(REGS.IR3) * s32(REGS.IR0)) + in_MAC3, shift, lm);
 }
 
-void GTE::NCS(const s16 V[3], u8 shift, bool lm)
+static void NCS(const s16 V[3], u8 shift, bool lm)
 {
   // [IR1,IR2,IR3] = [MAC1,MAC2,MAC3] = (LLM*V0) SAR (sf*12)
-  MulMatVec(&REGS.LLM[0][0], V[0], V[1], V[2], shift, lm);
+  MulMatVec(REGS.LLM, V[0], V[1], V[2], shift, lm);
 
   // [IR1,IR2,IR3] = [MAC1,MAC2,MAC3] = (BK*1000h + LCM*IR) SAR (sf*12)
-  MulMatVec(&REGS.LCM[0][0], REGS.BK, REGS.IR1, REGS.IR2, REGS.IR3, shift, lm);
+  MulMatVec(REGS.LCM, REGS.BK, REGS.IR1, REGS.IR2, REGS.IR3, shift, lm);
 
   // Color FIFO = [MAC1/16,MAC2/16,MAC3/16,CODE], [IR1,IR2,IR3] = [MAC1,MAC2,MAC3]
   PushRGBFromMAC();
 }
 
-void GTE::Execute_NCS(Instruction inst)
+static void Execute_NCS(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -996,7 +889,7 @@ void GTE::Execute_NCS(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_NCT(Instruction inst)
+static void Execute_NCT(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -1010,13 +903,13 @@ void GTE::Execute_NCT(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::NCCS(const s16 V[3], u8 shift, bool lm)
+static void NCCS(const s16 V[3], u8 shift, bool lm)
 {
   // [IR1,IR2,IR3] = [MAC1,MAC2,MAC3] = (LLM*V0) SAR (sf*12)
-  MulMatVec(&REGS.LLM[0][0], V[0], V[1], V[2], shift, lm);
+  MulMatVec(REGS.LLM, V[0], V[1], V[2], shift, lm);
 
   // [IR1,IR2,IR3] = [MAC1,MAC2,MAC3] = (BK*1000h + LCM*IR) SAR (sf*12)
-  MulMatVec(&REGS.LCM[0][0], REGS.BK, REGS.IR1, REGS.IR2, REGS.IR3, shift, lm);
+  MulMatVec(REGS.LCM, REGS.BK, REGS.IR1, REGS.IR2, REGS.IR3, shift, lm);
 
   // [MAC1,MAC2,MAC3] = [R*IR1,G*IR2,B*IR3] SHL 4          ;<--- for NCDx/NCCx
   // [MAC1,MAC2,MAC3] = [MAC1,MAC2,MAC3] SAR (sf*12)       ;<--- for NCDx/NCCx
@@ -1028,7 +921,7 @@ void GTE::NCCS(const s16 V[3], u8 shift, bool lm)
   PushRGBFromMAC();
 }
 
-void GTE::Execute_NCCS(Instruction inst)
+static void Execute_NCCS(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -1037,7 +930,7 @@ void GTE::Execute_NCCS(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_NCCT(Instruction inst)
+static void Execute_NCCT(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -1051,13 +944,13 @@ void GTE::Execute_NCCT(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::NCDS(const s16 V[3], u8 shift, bool lm)
+static void NCDS(const s16 V[3], u8 shift, bool lm)
 {
   // [IR1,IR2,IR3] = [MAC1,MAC2,MAC3] = (LLM*V0) SAR (sf*12)
-  MulMatVec(&REGS.LLM[0][0], V[0], V[1], V[2], shift, lm);
+  MulMatVec(REGS.LLM, V[0], V[1], V[2], shift, lm);
 
   // [IR1,IR2,IR3] = [MAC1,MAC2,MAC3] = (BK*1000h + LCM*IR) SAR (sf*12)
-  MulMatVec(&REGS.LCM[0][0], REGS.BK, REGS.IR1, REGS.IR2, REGS.IR3, shift, lm);
+  MulMatVec(REGS.LCM, REGS.BK, REGS.IR1, REGS.IR2, REGS.IR3, shift, lm);
 
   // No need to assign these to MAC[1-3], as it'll never overflow.
   // [MAC1,MAC2,MAC3] = [R*IR1,G*IR2,B*IR3] SHL 4          ;<--- for NCDx/NCCx
@@ -1072,7 +965,7 @@ void GTE::NCDS(const s16 V[3], u8 shift, bool lm)
   PushRGBFromMAC();
 }
 
-void GTE::Execute_NCDS(Instruction inst)
+static void Execute_NCDS(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -1081,7 +974,7 @@ void GTE::Execute_NCDS(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_NCDT(Instruction inst)
+static void Execute_NCDT(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -1095,7 +988,7 @@ void GTE::Execute_NCDT(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_CC(Instruction inst)
+static void Execute_CC(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -1103,7 +996,7 @@ void GTE::Execute_CC(Instruction inst)
   const bool lm = inst.lm;
 
   // [IR1,IR2,IR3] = [MAC1,MAC2,MAC3] = (BK*1000h + LCM*IR) SAR (sf*12)
-  MulMatVec(&REGS.LCM[0][0], REGS.BK, REGS.IR1, REGS.IR2, REGS.IR3, shift, lm);
+  MulMatVec(REGS.LCM, REGS.BK, REGS.IR1, REGS.IR2, REGS.IR3, shift, lm);
 
   // [MAC1,MAC2,MAC3] = [R*IR1,G*IR2,B*IR3] SHL 4
   // [MAC1,MAC2,MAC3] = [MAC1,MAC2,MAC3] SAR (sf*12)
@@ -1117,7 +1010,7 @@ void GTE::Execute_CC(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_CDP(Instruction inst)
+static void Execute_CDP(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -1125,7 +1018,7 @@ void GTE::Execute_CDP(Instruction inst)
   const bool lm = inst.lm;
 
   // [IR1,IR2,IR3] = [MAC1,MAC2,MAC3] = (BK*1000h + LCM*IR) SAR (sf*12)
-  MulMatVec(&REGS.LCM[0][0], REGS.BK, REGS.IR1, REGS.IR2, REGS.IR3, shift, lm);
+  MulMatVec(REGS.LCM, REGS.BK, REGS.IR1, REGS.IR2, REGS.IR3, shift, lm);
 
   // No need to assign these to MAC[1-3], as it'll never overflow.
   // [MAC1,MAC2,MAC3] = [R*IR1,G*IR2,B*IR3] SHL 4
@@ -1143,7 +1036,7 @@ void GTE::Execute_CDP(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::DPCS(const u8 color[3], u8 shift, bool lm)
+static void DPCS(const u8 color[3], u8 shift, bool lm)
 {
   // In: [IR1,IR2,IR3]=Vector, FC=Far Color, IR0=Interpolation value, CODE=MSB of RGBC
   // [MAC1,MAC2,MAC3] = [R,G,B] SHL 16                     ;<--- for DPCS/DPCT
@@ -1158,7 +1051,7 @@ void GTE::DPCS(const u8 color[3], u8 shift, bool lm)
   PushRGBFromMAC();
 }
 
-void GTE::Execute_DPCS(Instruction inst)
+static void Execute_DPCS(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -1167,7 +1060,7 @@ void GTE::Execute_DPCS(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_DPCT(Instruction inst)
+static void Execute_DPCT(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -1180,7 +1073,7 @@ void GTE::Execute_DPCT(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_DCPL(Instruction inst)
+static void Execute_DCPL(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -1202,7 +1095,7 @@ void GTE::Execute_DCPL(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_INTPL(Instruction inst)
+static void Execute_INTPL(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -1220,7 +1113,7 @@ void GTE::Execute_INTPL(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_GPL(Instruction inst)
+static void Execute_GPL(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -1239,7 +1132,7 @@ void GTE::Execute_GPL(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::Execute_GPF(Instruction inst)
+static void Execute_GPF(Instruction inst)
 {
   REGS.FLAG.Clear();
 
@@ -1258,19 +1151,17 @@ void GTE::Execute_GPF(Instruction inst)
   REGS.FLAG.UpdateError();
 }
 
-void GTE::ExecuteInstruction(u32 inst_bits)
+void ExecuteInstruction(u32 inst_bits)
 {
   const Instruction inst{inst_bits};
   switch (inst.command)
   {
     case 0x01:
-      CPU::AddGTETicks(15);
       Execute_RTPS(inst);
       break;
 
     case 0x06:
     {
-      CPU::AddGTETicks(8);
       if (g_settings.gpu_pgxp_enable && g_settings.gpu_pgxp_culling)
         Execute_NCLIP_PGXP(inst);
       else
@@ -1279,102 +1170,82 @@ void GTE::ExecuteInstruction(u32 inst_bits)
     break;
 
     case 0x0C:
-      CPU::AddGTETicks(6);
       Execute_OP(inst);
       break;
 
     case 0x10:
-      CPU::AddGTETicks(8);
       Execute_DPCS(inst);
       break;
 
     case 0x11:
-      CPU::AddGTETicks(7);
       Execute_INTPL(inst);
       break;
 
     case 0x12:
-      CPU::AddGTETicks(8);
       Execute_MVMVA(inst);
       break;
 
     case 0x13:
-      CPU::AddGTETicks(19);
       Execute_NCDS(inst);
       break;
 
     case 0x14:
-      CPU::AddGTETicks(13);
       Execute_CDP(inst);
       break;
 
     case 0x16:
-      CPU::AddGTETicks(44);
       Execute_NCDT(inst);
       break;
 
     case 0x1B:
-      CPU::AddGTETicks(17);
       Execute_NCCS(inst);
       break;
 
     case 0x1C:
-      CPU::AddGTETicks(11);
       Execute_CC(inst);
       break;
 
     case 0x1E:
-      CPU::AddGTETicks(14);
       Execute_NCS(inst);
       break;
 
     case 0x20:
-      CPU::AddGTETicks(30);
       Execute_NCT(inst);
       break;
 
     case 0x28:
-      CPU::AddGTETicks(5);
       Execute_SQR(inst);
       break;
 
     case 0x29:
-      CPU::AddGTETicks(8);
       Execute_DCPL(inst);
       break;
 
     case 0x2A:
-      CPU::AddGTETicks(17);
       Execute_DPCT(inst);
       break;
 
     case 0x2D:
-      CPU::AddGTETicks(5);
       Execute_AVSZ3(inst);
       break;
 
     case 0x2E:
-      CPU::AddGTETicks(6);
       Execute_AVSZ4(inst);
       break;
 
     case 0x30:
-      CPU::AddGTETicks(23);
       Execute_RTPT(inst);
       break;
 
     case 0x3D:
-      CPU::AddGTETicks(5);
       Execute_GPF(inst);
       break;
 
     case 0x3E:
-      CPU::AddGTETicks(5);
       Execute_GPL(inst);
       break;
 
     case 0x3F:
-      CPU::AddGTETicks(39);
       Execute_NCCT(inst);
       break;
 
@@ -1384,18 +1255,16 @@ void GTE::ExecuteInstruction(u32 inst_bits)
   }
 }
 
-GTE::InstructionImpl GTE::GetInstructionImpl(u32 inst_bits, TickCount* ticks)
+InstructionImpl GetInstructionImpl(u32 inst_bits)
 {
   const Instruction inst{inst_bits};
   switch (inst.command)
   {
     case 0x01:
-      *ticks = 15;
       return &Execute_RTPS;
 
     case 0x06:
     {
-      *ticks = 8;
       if (g_settings.gpu_pgxp_enable && g_settings.gpu_pgxp_culling)
         return &Execute_NCLIP_PGXP;
       else
@@ -1403,427 +1272,69 @@ GTE::InstructionImpl GTE::GetInstructionImpl(u32 inst_bits, TickCount* ticks)
     }
 
     case 0x0C:
-      *ticks = 6;
       return &Execute_OP;
 
     case 0x10:
-      *ticks = 8;
       return &Execute_DPCS;
 
     case 0x11:
-      *ticks = 7;
       return &Execute_INTPL;
 
     case 0x12:
-      *ticks = 8;
       return &Execute_MVMVA;
 
     case 0x13:
-      *ticks = 19;
       return &Execute_NCDS;
 
     case 0x14:
-      *ticks = 13;
       return &Execute_CDP;
 
     case 0x16:
-      *ticks = 44;
       return &Execute_NCDT;
 
     case 0x1B:
-      *ticks = 17;
       return &Execute_NCCS;
 
     case 0x1C:
-      *ticks = 11;
       return &Execute_CC;
 
     case 0x1E:
-      *ticks = 14;
       return &Execute_NCS;
 
     case 0x20:
-      *ticks = 30;
       return &Execute_NCT;
 
     case 0x28:
-      *ticks = 5;
       return &Execute_SQR;
 
     case 0x29:
-      *ticks = 8;
       return &Execute_DCPL;
 
     case 0x2A:
-      *ticks = 17;
       return &Execute_DPCT;
 
     case 0x2D:
-      *ticks = 5;
       return &Execute_AVSZ3;
 
     case 0x2E:
-      *ticks = 6;
       return &Execute_AVSZ4;
 
     case 0x30:
-      *ticks = 23;
       return &Execute_RTPT;
 
     case 0x3D:
-      *ticks = 5;
       return &Execute_GPF;
 
     case 0x3E:
-      *ticks = 5;
       return &Execute_GPL;
 
     case 0x3F:
-      *ticks = 39;
       return &Execute_NCCT;
 
     default:
       Panic("Missing handler");
+      return nullptr;
   }
 }
 
-#ifdef ENABLE_FREECAM
-
-bool GTE::IsFreecamEnabled()
-{
-  return s_config.freecam_enabled;
-}
-
-void GTE::SetFreecamEnabled(bool enabled)
-{
-  if (s_config.freecam_enabled == enabled)
-    return;
-
-  s_config.freecam_enabled = enabled;
-  if (enabled)
-  {
-    s_config.freecam_transform_changed.store(true, std::memory_order_release);
-    s_config.freecam_update_time = Timer::GetCurrentValue();
-  }
-}
-
-void GTE::SetFreecamMoveAxis(u32 axis, float x)
-{
-  DebugAssert(axis < 3);
-  s_config.freecam_move.F32[axis] = x;
-  SetFreecamEnabled(true);
-}
-
-void GTE::SetFreecamRotateAxis(u32 axis, float x)
-{
-  DebugAssert(axis < 3);
-  s_config.freecam_turn.F32[axis] = x;
-  SetFreecamEnabled(true);
-}
-
-void GTE::UpdateFreecam(u64 current_time)
-{
-  if (!s_config.freecam_enabled)
-  {
-    s_config.freecam_active = false;
-    return;
-  }
-
-  const float dt = std::clamp(
-    static_cast<float>(Timer::ConvertValueToSeconds(current_time - s_config.freecam_update_time)), 0.0f, 1.0f);
-  s_config.freecam_update_time = current_time;
-
-  bool changed = true;
-  s_config.freecam_transform_changed.compare_exchange_strong(changed, false, std::memory_order_acq_rel);
-
-  if (!(s_config.freecam_move == GSVector4::zero()).alltrue())
-  {
-    GSVector4 disp = s_config.freecam_move * GSVector4(s_config.freecam_move_speed * dt);
-    if (s_config.freecam_reverse_transform_order)
-      disp = s_config.freecam_inverted_rotation_matrix * disp;
-
-    s_config.freecam_translation += disp;
-    changed = true;
-  }
-
-  if (!(s_config.freecam_turn == GSVector4::zero()).alltrue())
-  {
-    s_config.freecam_rotation += s_config.freecam_turn * GSVector4(s_config.freecam_turn_speed *
-                                                                   static_cast<float>(std::numbers::pi / 180.0) * dt);
-
-    // wrap around -360 degrees/360 degrees
-    constexpr GSVector4 min_rot = GSVector4::cxpr(static_cast<float>(std::numbers::pi * -2.0));
-    constexpr GSVector4 max_rot = GSVector4::cxpr(static_cast<float>(std::numbers::pi * 2.0));
-    s_config.freecam_rotation =
-      s_config.freecam_rotation.blend32(s_config.freecam_rotation + max_rot, (s_config.freecam_rotation < min_rot));
-    s_config.freecam_rotation =
-      s_config.freecam_rotation.blend32(s_config.freecam_rotation + min_rot, (s_config.freecam_rotation > max_rot));
-
-    changed = true;
-  }
-
-  if (!changed)
-    return;
-
-  bool any_xform = false;
-  s_config.freecam_matrix = GSMatrix4x4::Identity();
-
-  // translate than rotate, since the camera is rotating around a point
-  // remember, matrix transformation happens in the opposite of the multiplication order
-
-  if (!s_config.freecam_reverse_transform_order)
-  {
-    if (s_config.freecam_translation.x != 0.0f || s_config.freecam_translation.y != 0.0f ||
-        s_config.freecam_translation.z != 0.0f)
-    {
-      s_config.freecam_matrix = GSMatrix4x4::Translation(s_config.freecam_translation.x, s_config.freecam_translation.y,
-                                                         s_config.freecam_translation.z);
-      any_xform = true;
-    }
-
-    if (s_config.freecam_rotation.z != 0.0f)
-    {
-      s_config.freecam_matrix *= GSMatrix4x4::RotationZ(s_config.freecam_rotation.z);
-      any_xform = true;
-    }
-
-    if (s_config.freecam_rotation.y != 0.0f)
-    {
-      s_config.freecam_matrix *= GSMatrix4x4::RotationY(s_config.freecam_rotation.y);
-      any_xform = true;
-    }
-
-    if (s_config.freecam_rotation.x != 0.0f)
-    {
-      s_config.freecam_matrix *= GSMatrix4x4::RotationX(s_config.freecam_rotation.x);
-      any_xform = true;
-    }
-  }
-  else
-  {
-    if (s_config.freecam_rotation.x != 0.0f)
-    {
-      s_config.freecam_matrix *= GSMatrix4x4::RotationX(s_config.freecam_rotation.x);
-      any_xform = true;
-    }
-
-    if (s_config.freecam_rotation.y != 0.0f)
-    {
-      s_config.freecam_matrix *= GSMatrix4x4::RotationY(s_config.freecam_rotation.y);
-      any_xform = true;
-    }
-
-    if (s_config.freecam_rotation.z != 0.0f)
-    {
-      s_config.freecam_matrix *= GSMatrix4x4::RotationZ(s_config.freecam_rotation.z);
-      any_xform = true;
-    }
-
-    if (any_xform)
-      s_config.freecam_inverted_rotation_matrix = s_config.freecam_matrix.invert();
-    else
-      s_config.freecam_inverted_rotation_matrix = GSMatrix4x4::Identity();
-
-    if (s_config.freecam_translation.x != 0.0f || s_config.freecam_translation.y != 0.0f ||
-        s_config.freecam_translation.z != 0.0f)
-    {
-      s_config.freecam_matrix *= GSMatrix4x4::Translation(
-        s_config.freecam_translation.x, s_config.freecam_translation.y, s_config.freecam_translation.z);
-      any_xform = true;
-    }
-  }
-
-  s_config.freecam_active = any_xform;
-}
-
-void GTE::ResetFreecam()
-{
-  s_config.freecam_active = false;
-  s_config.freecam_rotation = GSVector4::zero();
-  s_config.freecam_translation = GSVector4::zero();
-  s_config.freecam_transform_changed.store(false, std::memory_order_release);
-}
-
-void GTE::ApplyFreecam(s64& x, s64& y, s64& z)
-{
-  constexpr double scale = 1 << 12;
-
-  GSVector4 xyz(static_cast<float>(static_cast<double>(x) / scale), static_cast<float>(static_cast<double>(y) / scale),
-                static_cast<float>(static_cast<double>(z) / scale), 1.0f);
-
-  xyz = s_config.freecam_matrix * xyz;
-
-  x = static_cast<s64>(static_cast<double>(xyz.x) * scale);
-  y = static_cast<s64>(static_cast<double>(xyz.y) * scale);
-  z = static_cast<s64>(static_cast<double>(xyz.z) * scale);
-}
-
-void GTE::DrawFreecamWindow(float scale)
-{
-  const ImGuiStyle& style = ImGui::GetStyle();
-  const float label_width = 140.0f * scale;
-  const float item_width = 350.0f * scale;
-  const float padding_height = 5.0f * scale;
-
-  bool freecam_enabled = s_config.freecam_enabled;
-  bool enabled_changed = false;
-  bool changed = false;
-
-  if (ImGui::CollapsingHeader("Settings", ImGuiTreeNodeFlags_DefaultOpen))
-  {
-    const float third_width = 100.0f * scale;
-    const float second_width = item_width - third_width;
-
-    enabled_changed = ImGui::Checkbox("Enable Freecam", &freecam_enabled);
-
-    changed |= ImGui::Checkbox("Reverse Transform Order", &s_config.freecam_reverse_transform_order);
-    ImGui::SetItemTooltip("Swaps the order that the camera rotation/offset is applied.\nCan work better in some games "
-                          "that use different modelview matrices.");
-
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + padding_height);
-
-    ImGui::Columns(3, "Settings", false);
-    ImGui::SetColumnWidth(0, label_width);
-    ImGui::SetColumnWidth(1, second_width);
-    ImGui::SetColumnWidth(2, third_width);
-
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + style.ItemInnerSpacing.y);
-    ImGui::TextUnformatted("Movement Speed:");
-    ImGui::NextColumn();
-    ImGui::SetNextItemWidth(second_width - (style.FramePadding.x * 2.0f));
-    ImGui::DragFloat("##MovementSpeed", &s_config.freecam_move_speed, 1.0f, 0.0f, FREECAM_MAX_MOVE_SPEED);
-    ImGui::NextColumn();
-    if (ImGui::Button("Reset##ResetMovementSpeed"))
-      s_config.freecam_move_speed = FREECAM_DEFAULT_MOVE_SPEED;
-    ImGui::NextColumn();
-
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + style.ItemInnerSpacing.y);
-    ImGui::TextUnformatted("Turning Speed:");
-    ImGui::NextColumn();
-    ImGui::SetNextItemWidth(second_width - (style.FramePadding.x * 2.0f));
-    ImGui::DragFloat("##TurnSpeed", &s_config.freecam_turn_speed, 1.0f, 0.0f, FREECAM_MAX_TURN_SPEED);
-    ImGui::NextColumn();
-    if (ImGui::Button("Reset##ResetTurnSpeed"))
-      s_config.freecam_turn_speed = FREECAM_DEFAULT_TURN_SPEED;
-    ImGui::NextColumn();
-
-    ImGui::Columns(1);
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + padding_height);
-  }
-
-  if (ImGui::CollapsingHeader("Rotation", ImGuiTreeNodeFlags_DefaultOpen))
-  {
-    ImGui::Columns(2, "Rotation", false);
-    ImGui::SetColumnWidth(0, label_width);
-    ImGui::SetColumnWidth(1, item_width + (style.FramePadding.x * 2.0f));
-
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + style.ItemInnerSpacing.y);
-    ImGui::TextUnformatted("X Rotation (Pitch):");
-    ImGui::NextColumn();
-    ImGui::SetNextItemWidth(item_width);
-    changed |= ImGui::SliderAngle("##XRot", &s_config.freecam_rotation.x, FREECAM_MIN_ROTATION, FREECAM_MAX_ROTATION);
-    ImGui::NextColumn();
-
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + style.ItemInnerSpacing.y);
-    ImGui::TextUnformatted("Y Rotation (Yaw):");
-    ImGui::NextColumn();
-    ImGui::SetNextItemWidth(item_width);
-    changed |= ImGui::SliderAngle("##YRot", &s_config.freecam_rotation.y, FREECAM_MIN_ROTATION, FREECAM_MAX_ROTATION);
-    ImGui::NextColumn();
-
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + style.ItemInnerSpacing.y);
-    ImGui::TextUnformatted("Z Rotation (Roll):");
-    ImGui::NextColumn();
-    ImGui::SetNextItemWidth(item_width);
-    changed |= ImGui::SliderAngle("##ZRot", &s_config.freecam_rotation.z, FREECAM_MIN_ROTATION, FREECAM_MAX_ROTATION);
-    ImGui::NextColumn();
-
-    ImGui::Columns(1);
-
-    if (ImGui::Button("Reset##ResetRotation"))
-    {
-      s_config.freecam_rotation = GSVector4::zero();
-      changed = true;
-    }
-
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + padding_height);
-  }
-
-  if (ImGui::CollapsingHeader("Translation", ImGuiTreeNodeFlags_DefaultOpen))
-  {
-    ImGui::Columns(2, "Translation", false);
-    ImGui::SetColumnWidth(0, label_width);
-    ImGui::SetColumnWidth(1, item_width + (style.FramePadding.x * 2.0f));
-
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + style.ItemInnerSpacing.y);
-    ImGui::TextUnformatted("X Offset:");
-    ImGui::NextColumn();
-    ImGui::SetNextItemWidth(item_width);
-    changed |= ImGui::DragFloat("##XOffset", &s_config.freecam_translation.x, 1.0f, FREECAM_MIN_TRANSLATION,
-                                FREECAM_MAX_TRANSLATION, "%.1f", ImGuiSliderFlags_None);
-    ImGui::NextColumn();
-
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + style.ItemInnerSpacing.y);
-    ImGui::TextUnformatted("Y Offset:");
-    ImGui::NextColumn();
-    ImGui::SetNextItemWidth(item_width);
-    changed |= ImGui::DragFloat("##YOffset", &s_config.freecam_translation.y, 1.0f, FREECAM_MIN_TRANSLATION,
-                                FREECAM_MAX_TRANSLATION, "%.1f", ImGuiSliderFlags_None);
-    ImGui::NextColumn();
-
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + style.ItemInnerSpacing.y);
-    ImGui::TextUnformatted("Z Offset:");
-    ImGui::NextColumn();
-    ImGui::SetNextItemWidth(item_width);
-    changed |= ImGui::DragFloat("##ZOffset", &s_config.freecam_translation.z, 1.0f, FREECAM_MIN_TRANSLATION,
-                                FREECAM_MAX_TRANSLATION, "%.1f", ImGuiSliderFlags_None);
-    ImGui::NextColumn();
-
-    ImGui::Columns(1);
-
-    if (ImGui::Button("Reset##ResetTranslation"))
-    {
-      s_config.freecam_translation = GSVector4::zero();
-      changed = true;
-    }
-  }
-
-  if (enabled_changed || (!freecam_enabled && changed))
-    Host::RunOnCoreThread([enabled = freecam_enabled || changed]() { SetFreecamEnabled(enabled); });
-
-  if (changed)
-    s_config.freecam_transform_changed.store(true, std::memory_order_release);
-}
-
-#else // ENABLE_FREECAM
-
-bool GTE::IsFreecamEnabled()
-{
-  return false;
-}
-
-void GTE::SetFreecamEnabled(bool enabled)
-{
-}
-
-void GTE::SetFreecamMoveAxis(u32 axis, float x)
-{
-}
-
-void GTE::SetFreecamRotateAxis(u32 axis, float x)
-{
-}
-
-void GTE::UpdateFreecam(u64 current_time)
-{
-}
-
-void GTE::ResetFreecam()
-{
-}
-
-void GTE::DrawFreecamWindow(float scale)
-{
-}
-
-#endif // ENABLE_FREECAM
+} // namespace GTE

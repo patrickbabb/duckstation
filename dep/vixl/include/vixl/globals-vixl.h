@@ -27,10 +27,6 @@
 #ifndef VIXL_GLOBALS_H
 #define VIXL_GLOBALS_H
 
-#if __cplusplus < 201703L
-#error VIXL requires C++17
-#endif
-
 // Get standard C99 macros for integer types.
 #ifndef __STDC_CONSTANT_MACROS
 #define __STDC_CONSTANT_MACROS
@@ -70,8 +66,7 @@ typedef uint8_t byte;
 const int KBytes = 1024;
 const int MBytes = 1024 * KBytes;
 
-const int kBitsPerByteLog2 = 3;
-const int kBitsPerByte = 1 << kBitsPerByteLog2;
+const int kBitsPerByte = 8;
 
 template <int SizeInBits>
 struct Unsigned;
@@ -158,7 +153,7 @@ struct Unsigned<64> {
 #endif
 // This is not as powerful as template based assertions, but it is simple.
 // It assumes that the descriptions are unique. If this starts being a problem,
-// we can switch to a different implementation.
+// we can switch to a different implemention.
 #define VIXL_CONCAT(a, b) a##b
 #if __cplusplus >= 201103L
 #define VIXL_STATIC_ASSERT_LINE(line_unused, condition, message) \
@@ -190,9 +185,10 @@ inline void USE(const T1&, const T2&, const T3&) {}
 template <typename T1, typename T2, typename T3, typename T4>
 inline void USE(const T1&, const T2&, const T3&, const T4&) {}
 
-#define VIXL_ALIGNMENT_EXCEPTION()                \
-  do {                                            \
-    VIXL_ABORT_WITH_MSG("ALIGNMENT EXCEPTION\t"); \
+#define VIXL_ALIGNMENT_EXCEPTION()            \
+  do {                                        \
+    fprintf(stderr, "ALIGNMENT EXCEPTION\t"); \
+    VIXL_ABORT();                             \
   } while (0)
 
 // The clang::fallthrough attribute is used along with the Wimplicit-fallthrough
@@ -207,25 +203,13 @@ inline void USE(const T1&, const T2&, const T3&, const T4&) {}
 #if __has_warning("-Wimplicit-fallthrough") && __cplusplus >= 201103L
 #define VIXL_FALLTHROUGH() [[clang::fallthrough]]
 // Fallthrough annotation for GCC >= 7.
-#elif defined(__GNUC__) && __GNUC__ >= 7
+#elif __GNUC__ >= 7
 #define VIXL_FALLTHROUGH() __attribute__((fallthrough))
 #else
 #define VIXL_FALLTHROUGH() \
   do {                     \
   } while (0)
 #endif
-
-// Evaluate 'init' to an std::optional and return if it's empty. If 'init' is
-// not empty then define a variable 'name' with the value inside the
-// std::optional.
-#define VIXL_DEFINE_OR_RETURN(name, init) \
-  auto opt##name = init;                  \
-  if (!opt##name) return;                 \
-  auto name = *opt##name;
-#define VIXL_DEFINE_OR_RETURN_FALSE(name, init) \
-  auto opt##name = init;                        \
-  if (!opt##name) return false;                 \
-  auto name = *opt##name;
 
 #if __cplusplus >= 201103L
 #define VIXL_NO_RETURN [[noreturn]]
@@ -240,19 +224,17 @@ inline void USE(const T1&, const T2&, const T3&, const T4&) {}
 
 #if __cplusplus >= 201103L
 #define VIXL_OVERRIDE override
-#define VIXL_CONSTEXPR constexpr
-#define VIXL_HAS_CONSTEXPR 1
 #else
 #define VIXL_OVERRIDE
-#define VIXL_CONSTEXPR
 #endif
 
-// With VIXL_NEGATIVE_TESTING on, VIXL_ASSERT and VIXL_CHECK will throw
-// exceptions but C++11 marks destructors as noexcept(true) by default.
-#if defined(VIXL_NEGATIVE_TESTING) && __cplusplus >= 201103L
-#define VIXL_NEGATIVE_TESTING_ALLOW_EXCEPTION noexcept(false)
+// Some functions might only be marked as "noreturn" for the DEBUG build. This
+// macro should be used for such cases (for more details see what
+// VIXL_UNREACHABLE expands to).
+#ifdef VIXL_DEBUG
+#define VIXL_DEBUG_NO_RETURN VIXL_NO_RETURN
 #else
-#define VIXL_NEGATIVE_TESTING_ALLOW_EXCEPTION
+#define VIXL_DEBUG_NO_RETURN
 #endif
 
 #ifdef VIXL_INCLUDE_SIMULATOR_AARCH64
@@ -287,23 +269,15 @@ inline void USE(const T1&, const T2&, const T3&, const T4&) {}
 
 // Target Architecture/ISA
 #ifdef VIXL_INCLUDE_TARGET_A64
-#ifndef VIXL_INCLUDE_TARGET_AARCH64
 #define VIXL_INCLUDE_TARGET_AARCH64
-#endif
 #endif
 
 #if defined(VIXL_INCLUDE_TARGET_A32) && defined(VIXL_INCLUDE_TARGET_T32)
-#ifndef VIXL_INCLUDE_TARGET_AARCH32
 #define VIXL_INCLUDE_TARGET_AARCH32
-#endif
 #elif defined(VIXL_INCLUDE_TARGET_A32)
-#ifndef VIXL_INCLUDE_TARGET_A32_ONLY
 #define VIXL_INCLUDE_TARGET_A32_ONLY
-#endif
 #else
-#ifndef VIXL_INCLUDE_TARGET_T32_ONLY
 #define VIXL_INCLUDE_TARGET_T32_ONLY
-#endif
 #endif
 
 

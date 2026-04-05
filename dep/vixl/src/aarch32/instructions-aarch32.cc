@@ -95,10 +95,10 @@ QRegister VRegister::Q() const {
 
 
 Register RegisterList::GetFirstAvailableRegister() const {
-  if (list_ == 0) {
-    return Register();
+  for (uint32_t i = 0; i < kNumberOfRegisters; i++) {
+    if (((list_ >> i) & 1) != 0) return Register(i);
   }
-  return Register(CountTrailingZeros(list_));
+  return Register();
 }
 
 
@@ -651,7 +651,7 @@ bool ImmediateT32::IsImmediateT32(uint32_t imm) {
       (((imm & 0xff00) == 0) || ((imm & 0xff) == 0)))
     return true;
   /* isolate least-significant set bit */
-  uint32_t lsb = imm & UnsignedNegate(imm);
+  uint32_t lsb = imm & -imm;
   /* if imm is less than lsb*256 then it fits, but instead we test imm/256 to
   * avoid overflow (underflow is always a successful case) */
   return ((imm >> 8) < lsb);
@@ -702,7 +702,7 @@ bool ImmediateA32::IsImmediateA32(uint32_t imm) {
    * that the least-significant set bit is always an even bit */
   imm = imm | ((imm >> 1) & 0x55555555);
   /* isolate least-significant set bit (always even) */
-  uint32_t lsb = imm & UnsignedNegate(imm);
+  uint32_t lsb = imm & -imm;
   /* if imm is less than lsb*256 then it fits, but instead we test imm/256 to
    * avoid overflow (underflow is always a successful case) */
   return ((imm >> 8) < lsb);

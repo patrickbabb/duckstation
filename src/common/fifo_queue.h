@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #pragma once
 #include "assert.h"
 #include "types.h"
@@ -26,15 +23,7 @@ public:
   T* GetWritePointer() { return &m_ptr[m_tail]; }
   u32 GetSize() const { return m_size; }
   u32 GetSpace() const { return CAPACITY - m_size; }
-  u32 GetContiguousSpace() const
-  {
-    if (m_tail == m_head && m_size > 0)
-      return 0;
-    else if (m_tail >= m_head)
-      return (CAPACITY - m_tail);
-    else
-      return (m_head - m_tail);
-  }
+  u32 GetContiguousSpace() const { return (m_tail >= m_head) ? (CAPACITY - m_tail) : (m_head - m_tail); }
   u32 GetContiguousSize() const { return std::min<u32>(CAPACITY - m_head, m_size); }
   bool IsEmpty() const { return m_size == 0; }
   bool IsFull() const { return m_size == CAPACITY; }
@@ -54,7 +43,7 @@ public:
     return ref;
   }
 
-  template<class Y = T, std::enable_if_t<std::is_standard_layout_v<Y> && std::is_trivial_v<Y>, int> = 0>
+  template<class Y = T, std::enable_if_t<std::is_pod_v<Y>, int> = 0>
   T& Push(const T& value)
   {
     T& ref = PushAndGetReference();
@@ -62,7 +51,7 @@ public:
     return ref;
   }
 
-  template<class Y = T, std::enable_if_t<!std::is_standard_layout_v<Y> || !std::is_trivial_v<Y>, int> = 0>
+  template<class Y = T, std::enable_if_t<!std::is_pod_v<Y>, int> = 0>
   T& Push(const T& value)
   {
     T& ref = PushAndGetReference();
@@ -71,7 +60,7 @@ public:
   }
 
   // faster version of push_back_range for POD types which can be memcpy()ed
-  template<class Y = T, std::enable_if_t<std::is_standard_layout_v<Y> && std::is_trivial_v<Y>, int> = 0>
+  template<class Y = T, std::enable_if_t<std::is_pod_v<Y>, int> = 0>
   void PushRange(const T* data, u32 size)
   {
     DebugAssert((m_size + size) <= CAPACITY);
@@ -91,7 +80,7 @@ public:
     m_size += size;
   }
 
-  template<class Y = T, std::enable_if_t<!std::is_standard_layout_v<Y> || !std::is_trivial_v<Y>, int> = 0>
+  template<class Y = T, std::enable_if_t<!std::is_pod_v<Y>, int> = 0>
   void PushRange(const T* data, u32 size)
   {
     DebugAssert((m_size + size) <= CAPACITY);
@@ -137,25 +126,10 @@ public:
     return val;
   }
 
-  template<class Y = T, std::enable_if_t<std::is_standard_layout_v<Y> && std::is_trivial_v<Y>, int> = 0>
   void PopRange(T* out_data, u32 count)
   {
     DebugAssert(m_size >= count);
-    do
-    {
-      const u32 contig_count = std::min(count, CAPACITY - m_head);
-      std::memcpy(out_data, &m_ptr[m_head], sizeof(T) * contig_count);
-      out_data += contig_count;
-      m_head = (m_head + contig_count) % CAPACITY;
-      m_size -= contig_count;
-      count -= contig_count;
-    } while (count > 0);
-  }
 
-  template<class Y = T, std::enable_if_t<!std::is_standard_layout_v<Y> || !std::is_trivial_v<Y>, int> = 0>
-  void PopRange(T* out_data, u32 count)
-  {
-    DebugAssert(m_size >= count);
     for (u32 i = 0; i < count; i++)
     {
       out_data[i] = std::move(m_ptr[m_head]);

@@ -27,10 +27,10 @@
 #ifndef VIXL_POOL_MANAGER_IMPL_H_
 #define VIXL_POOL_MANAGER_IMPL_H_
 
-#include <algorithm>
-
-#include "assembler-base-vixl.h"
 #include "pool-manager.h"
+
+#include <algorithm>
+#include "assembler-base-vixl.h"
 
 namespace vixl {
 
@@ -264,14 +264,14 @@ bool PoolManager<T>::MustEmit(T pc,
     if (checkpoint < temp.min_location_) return true;
   }
 
-  bool temp_not_placed_yet = true;
+  bool tempNotPlacedYet = true;
   for (int i = static_cast<int>(objects_.size()) - 1; i >= 0; --i) {
     const PoolObject<T>& current = objects_[i];
-    if (temp_not_placed_yet && PoolObjectLessThan(current, temp)) {
+    if (tempNotPlacedYet && PoolObjectLessThan(current, temp)) {
       checkpoint = UpdateCheckpointForObject(checkpoint, &temp);
       if (checkpoint < temp.min_location_) return true;
       if (CheckFuturePC(pc, checkpoint)) return true;
-      temp_not_placed_yet = false;
+      tempNotPlacedYet = false;
     }
     if (current.label_base_ == label_base) continue;
     checkpoint = UpdateCheckpointForObject(checkpoint, &current);
@@ -279,7 +279,7 @@ bool PoolManager<T>::MustEmit(T pc,
     if (CheckFuturePC(pc, checkpoint)) return true;
   }
   // temp is the object with the smallest max_location_.
-  if (temp_not_placed_yet) {
+  if (tempNotPlacedYet) {
     checkpoint = UpdateCheckpointForObject(checkpoint, &temp);
     if (checkpoint < temp.min_location_) return true;
   }
@@ -487,7 +487,7 @@ void PoolManager<T>::Release(T pc) {
 }
 
 template <typename T>
-PoolManager<T>::~PoolManager<T>() VIXL_NEGATIVE_TESTING_ALLOW_EXCEPTION {
+PoolManager<T>::~PoolManager<T>() {
 #ifdef VIXL_DEBUG
   // Check for unbound objects.
   for (objects_iter iter = objects_.begin(); iter != objects_.end(); ++iter) {
@@ -497,7 +497,7 @@ PoolManager<T>::~PoolManager<T>() VIXL_NEGATIVE_TESTING_ALLOW_EXCEPTION {
   }
 #endif
   // Delete objects the pool manager owns.
-  for (typename std::vector<LocationBase<T>*>::iterator
+  for (typename std::vector<LocationBase<T> *>::iterator
            iter = delete_on_destruction_.begin(),
            end = delete_on_destruction_.end();
        iter != end;
@@ -517,6 +517,6 @@ int PoolManager<T>::GetPoolSizeForTest() const {
   }
   return size;
 }
-}  // namespace vixl
+}
 
 #endif  // VIXL_POOL_MANAGER_IMPL_H_

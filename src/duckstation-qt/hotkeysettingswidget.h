@@ -1,68 +1,34 @@
-// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #pragma once
-
+#include "core/types.h"
+#include <QtWidgets/QTabWidget>
 #include <QtCore/QMap>
-#include <QtWidgets/QWidget>
-
 #include <array>
 #include <vector>
 
-class QLabel;
-class QLineEdit;
-class QScrollArea;
-class QVBoxLayout;
-
-class ControllerSettingsWindow;
+class QtHostInterface;
+class QGridLayout;
 
 class HotkeySettingsWidget : public QWidget
 {
   Q_OBJECT
 
 public:
-  HotkeySettingsWidget(QWidget* parent, ControllerSettingsWindow* dialog);
+  HotkeySettingsWidget(QtHostInterface* host_interface, QWidget* parent = nullptr);
   ~HotkeySettingsWidget();
 
 private:
-  struct CategoryWidgets
-  {
-    QWidget* heading;
-    QLabel* label;
-    QLabel* line;
-    QVBoxLayout* layout;
-  };
-
-  class Container final : public QWidget
-  {
-  public:
-    Container(QWidget* parent);
-    ~Container() override;
-
-    QLineEdit* searchBox() const { return m_search; }
-
-    void resizeEvent(QResizeEvent* event) override;
-
-  private:
-    void repositionSearchBox();
-
-    QLineEdit* m_search;
-  };
-
-  QPalette getLabelPalette(bool is_dark_theme) const;
-  QPalette getRowPalette() const;
-
   void createUi();
   void createButtons();
 
-  void setFilter(const QString& filter);
+  QtHostInterface* m_host_interface;
 
-  void onThemeChanged(bool is_dark_theme);
+  QTabWidget* m_tab_widget;
 
-  ControllerSettingsWindow* m_dialog;
-  QScrollArea* m_scroll_area = nullptr;
-  Container* m_container = nullptr;
-  QVBoxLayout* m_layout = nullptr;
-
-  QMap<QString, CategoryWidgets> m_categories;
+  struct Category
+  {
+    QWidget* container;
+    QGridLayout* layout;
+  };
+  QMap<QString, Category> m_categories;
 };
+

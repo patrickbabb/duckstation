@@ -1,11 +1,8 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #pragma once
-
 #include "controller.h"
-
 #include <memory>
+#include <optional>
+#include <string_view>
 
 class DigitalController final : public Controller
 {
@@ -31,26 +28,34 @@ public:
     Count
   };
 
-  static const Controller::ControllerInfo INFO;
-  static const Controller::ControllerInfo INFO_POPN;
-  static const Controller::ControllerInfo INFO_DDGO;
-
-  DigitalController(u32 index, u16 button_mask);
+  DigitalController();
   ~DigitalController() override;
 
-  static std::unique_ptr<DigitalController> Create(u32 index, ControllerType type);
+  static std::unique_ptr<DigitalController> Create();
+  static std::optional<s32> StaticGetAxisCodeByName(std::string_view button_name);
+  static std::optional<s32> StaticGetButtonCodeByName(std::string_view button_name);
+  static AxisList StaticGetAxisNames();
+  static ButtonList StaticGetButtonNames();
+  static u32 StaticGetVibrationMotorCount();
+  static SettingList StaticGetSettings();
 
   ControllerType GetType() const override;
+  std::optional<s32> GetAxisCodeByName(std::string_view axis_name) const override;
+  std::optional<s32> GetButtonCodeByName(std::string_view button_name) const override;
 
   void Reset() override;
   bool DoState(StateWrapper& sw, bool apply_input_state) override;
 
-  float GetBindState(u32 index) const override;
-  void SetBindState(u32 index, float value) override;
+  bool GetButtonState(s32 button_code) const override;
+  void SetButtonState(s32 button_code, bool pressed) override;
   u32 GetButtonStateBits() const override;
 
   void ResetTransferState() override;
   bool Transfer(const u8 data_in, u8* data_out) override;
+
+  void SetButtonState(Button button, bool pressed);
+
+  void LoadSettings(const char* section) override;
 
 private:
   enum class TransferState : u8
@@ -64,7 +69,10 @@ private:
 
   // buttons are active low
   u16 m_button_state = UINT16_C(0xFFFF);
-  u16 m_button_mask = UINT16_C(0xFFFF);
 
   TransferState m_transfer_state = TransferState::Idle;
+
+  bool m_popn_controller_mode = false;
+
+  u8 GetButtonsLSBMask() const;
 };

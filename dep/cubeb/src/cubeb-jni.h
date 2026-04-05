@@ -3,19 +3,8 @@
 
 typedef struct cubeb_jni cubeb_jni;
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-cubeb_jni *
-cubeb_jni_init();
-int
-cubeb_get_output_latency_from_jni(cubeb_jni * cubeb_jni_ptr);
-void
-cubeb_jni_destroy(cubeb_jni * cubeb_jni_ptr);
-
-#ifdef __cplusplus
-};
-#endif
+cubeb_jni * cubeb_jni_init();
+int cubeb_get_output_latency_from_jni(cubeb_jni * cubeb_jni_ptr);
+void cubeb_jni_destroy(cubeb_jni * cubeb_jni_ptr);
 
 #endif // _CUBEB_JNI_H_

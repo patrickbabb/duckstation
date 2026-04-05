@@ -24,9 +24,9 @@
 // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include "utils-vixl.h"
-
 #include <cstdio>
+
+#include "utils-vixl.h"
 
 namespace vixl {
 
@@ -391,7 +391,7 @@ float FPToFloat(double value,
   }
 
   VIXL_UNREACHABLE();
-  return static_cast<float>(value);
+  return value;
 }
 
 // TODO: We should consider implementing a full FPToDouble(Float16)

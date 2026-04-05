@@ -1,36 +1,31 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #pragma once
-
+#include <QtWidgets/QWidget>
 #include "ui_achievementsettingswidget.h"
 
-#include <QtWidgets/QWidget>
-
-class SettingsWindow;
+class QtHostInterface;
+class SettingsDialog;
 
 class AchievementSettingsWidget : public QWidget
 {
   Q_OBJECT
 
 public:
-  explicit AchievementSettingsWidget(SettingsWindow* dialog, QWidget* parent);
+  explicit AchievementSettingsWidget(QtHostInterface* host_interface, QWidget* parent, SettingsDialog* dialog);
   ~AchievementSettingsWidget();
 
-private:
-  void setupAdditionalUi();
-
-  void updateLoginState();
-
-  void updateEnableState();
-  void onHardcoreModeStateChanged();
-  void onAchievementsNotificationDurationSliderChanged();
-  void onLeaderboardsNotificationDurationSliderChanged();
+private Q_SLOTS:
+  void onEnableToggled(bool checked);
+  void onChallengeModeToggled(bool checked);
   void onLoginLogoutPressed();
-  void onLoginCompleted();
   void onViewProfilePressed();
+  void onAchievementsLoaded(quint32 id, const QString& game_info_string, quint32 total, quint32 points);
+
+private:
+  bool confirmChallengeModeEnable();
+  void updateEnableState();
+  void updateLoginState();
 
   Ui::AchievementSettingsWidget m_ui;
 
-  SettingsWindow* m_dialog;
+  QtHostInterface* m_host_interface;
 };

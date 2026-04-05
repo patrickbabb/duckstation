@@ -1,10 +1,22 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #include "md5_digest.h"
 
-// based heavily on this public-domain implementation:
-// http://www.fourmilab.ch/md5/
+#ifndef HIGHFIRST
+#define byteReverse(buf, len) /* Nothing */
+#else
+/*
+ * Note: this code is harmless on little-endian machines.
+ */
+static void byteReverse(unsigned char* buf, unsigned longs)
+{
+  u32 t;
+  do
+  {
+    t = (u32)((unsigned)buf[3] << 8 | buf[2]) << 16 | ((unsigned)buf[1] << 8 | buf[0]);
+    *(u32*)buf = t;
+    buf += 4;
+  } while (--longs);
+}
+#endif
 
 /* The four core functions - F1 is optimized somewhat */
 
@@ -122,16 +134,6 @@ void MD5Digest::Reset()
   this->bits[1] = 0;
 }
 
-std::array<u8, MD5Digest::DIGEST_SIZE> MD5Digest::HashData(std::span<const u8> data)
-{
-  std::array<u8, DIGEST_SIZE> ret;
-
-  MD5Digest digest;
-  digest.Update(data);
-  digest.Final(ret);
-  return ret;
-}
-
 void MD5Digest::Update(const void* pData, u32 cbData)
 {
   u32 t;
@@ -159,6 +161,7 @@ void MD5Digest::Update(const void* pData, u32 cbData)
       return;
     }
     std::memcpy(p, pByteData, t);
+    byteReverse(this->in, 16);
     MD5Transform(this->buf, (u32*)this->in);
     pByteData += t;
     cbData -= t;
@@ -168,6 +171,7 @@ void MD5Digest::Update(const void* pData, u32 cbData)
   while (cbData >= 64)
   {
     std::memcpy(this->in, pByteData, 64);
+    byteReverse(this->in, 16);
     MD5Transform(this->buf, (u32*)this->in);
     pByteData += 64;
     cbData -= 64;
@@ -178,13 +182,7 @@ void MD5Digest::Update(const void* pData, u32 cbData)
   std::memcpy(this->in, pByteData, cbData);
 }
 
-void MD5Digest::Update(std::span<const u8> data)
-{
-  if (!data.empty())
-    Update(data.data(), static_cast<u32>(data.size_bytes()));
-}
-
-void MD5Digest::Final(std::span<u8, DIGEST_SIZE> digest)
+void MD5Digest::Final(u8 Digest[16])
 {
   u32 count;
   u8* p;
@@ -205,6 +203,7 @@ void MD5Digest::Final(std::span<u8, DIGEST_SIZE> digest)
   {
     /* Two lots of padding:  Pad the first block to 64 bytes */
     std::memset(p, 0, count);
+    byteReverse(this->in, 16);
     MD5Transform(this->buf, (u32*)this->in);
 
     /* Now fill the next block with 56 bytes */
@@ -215,11 +214,13 @@ void MD5Digest::Final(std::span<u8, DIGEST_SIZE> digest)
     /* Pad block to 56 bytes */
     std::memset(p, 0, count - 8);
   }
+  byteReverse(this->in, 14);
 
   /* Append length in bits and transform */
   ((u32*)this->in)[14] = this->bits[0];
   ((u32*)this->in)[15] = this->bits[1];
 
   MD5Transform(this->buf, (u32*)this->in);
-  std::memcpy(digest.data(), this->buf, 16);
+  byteReverse((unsigned char*)this->buf, 4);
+  std::memcpy(Digest, this->buf, 16);
 }

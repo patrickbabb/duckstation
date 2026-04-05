@@ -1,47 +1,51 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #pragma once
-
 #include "controller.h"
-
 #include <memory>
+#include <optional>
+#include <string_view>
 
 class PlayStationMouse final : public Controller
 {
 public:
-  enum class Binding : u8
+  enum class Button : u8
   {
     Left = 0,
     Right = 1,
-    ButtonCount = 2,
-
-    PointerX = 2,
-    PointerY = 3,
-    BindingCount = 4,
+    Count
   };
 
-  static const Controller::ControllerInfo INFO;
-
-  explicit PlayStationMouse(u32 index);
+  PlayStationMouse();
   ~PlayStationMouse() override;
 
-  static std::unique_ptr<PlayStationMouse> Create(u32 index);
+  static std::unique_ptr<PlayStationMouse> Create();
+  static std::optional<s32> StaticGetAxisCodeByName(std::string_view button_name);
+  static std::optional<s32> StaticGetButtonCodeByName(std::string_view button_name);
+  static AxisList StaticGetAxisNames();
+  static ButtonList StaticGetButtonNames();
+  static u32 StaticGetVibrationMotorCount();
+  static SettingList StaticGetSettings();
 
   ControllerType GetType() const override;
+  std::optional<s32> GetAxisCodeByName(std::string_view axis_name) const override;
+  std::optional<s32> GetButtonCodeByName(std::string_view button_name) const override;
 
   void Reset() override;
   bool DoState(StateWrapper& sw, bool apply_input_state) override;
 
-  float GetBindState(u32 index) const override;
-  void SetBindState(u32 index, float value) override;
+  bool GetButtonState(s32 button_code) const override;
+  void SetButtonState(s32 button_code, bool pressed) override;
 
   void ResetTransferState() override;
   bool Transfer(const u8 data_in, u8* data_out) override;
 
-  void LoadSettings(const SettingsInterface& si, const char* section, bool initial) override;
+  void SetButtonState(Button button, bool pressed);
+
+  void LoadSettings(const char* section) override;
+  bool GetSoftwareCursor(const Common::RGBA8Image** image, float* image_scale, bool* relative_mode) override;
 
 private:
+  void UpdatePosition();
+
   enum class TransferState : u8
   {
     Idle,
@@ -53,13 +57,15 @@ private:
     DeltaY
   };
 
-  float m_sensitivity_x = 1.0f;
-  float m_sensitivity_y = 1.0f;
+  s32 m_last_host_position_x = 0;
+  s32 m_last_host_position_y = 0;
 
   // buttons are active low
   u16 m_button_state = UINT16_C(0xFFFF);
-  float m_delta_x = 0;
-  float m_delta_y = 0;
+  s8 m_delta_x = 0;
+  s8 m_delta_y = 0;
 
   TransferState m_transfer_state = TransferState::Idle;
+
+  bool m_use_relative_mode = false;
 };

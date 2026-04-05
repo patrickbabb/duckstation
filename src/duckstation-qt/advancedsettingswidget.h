@@ -1,24 +1,19 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #pragma once
 #include <QtCore/QVector>
 #include <QtWidgets/QWidget>
 
 #include "ui_advancedsettingswidget.h"
 
-class SettingsWindow;
+class QtHostInterface;
+class SettingsDialog;
 
 class AdvancedSettingsWidget : public QWidget
 {
   Q_OBJECT
 
 public:
-  explicit AdvancedSettingsWidget(SettingsWindow* dialog, QWidget* parent);
+  explicit AdvancedSettingsWidget(QtHostInterface* host_interface, QWidget* parent, SettingsDialog* dialog);
   ~AdvancedSettingsWidget();
-
-Q_SIGNALS:
-  void onShowDebugOptionsChanged(bool enabled);
 
 private:
   struct TweakOption
@@ -50,16 +45,11 @@ private:
     };
   };
 
-  void addTweakOptions();
+  Ui::AdvancedSettingsWidget m_ui;
+
   void onResetToDefaultClicked();
 
-  void onLogChannelsButtonClicked();
-  void onAnyLogSinksChanged();
-  void onShowDebugOptionsStateChanged();
-
-  SettingsWindow* m_dialog;
-
-  Ui::AdvancedSettingsWidget m_ui;
+  QtHostInterface* m_host_interface;
 
   QVector<TweakOption> m_tweak_options;
 };

@@ -1,104 +1,55 @@
-// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #include "consolesettingswidget.h"
-#include "qtutils.h"
-#include "settingswindow.h"
-#include "settingwidgetbinder.h"
-
-#include "core/core.h"
-#include "core/game_database.h"
 #include "core/system.h"
+#include "qtutils.h"
+#include "settingsdialog.h"
+#include "settingwidgetbinder.h"
+#include <QtWidgets/QMessageBox>
 
-#include "util/cd_image.h"
-
-#include <QtWidgets/QPushButton>
-
-#include "moc_consolesettingswidget.cpp"
-
-static constexpr const int CDROM_SPEEDUP_VALUES[] = {1, 2, 3, 4, 5, 6, 0};
-
-ConsoleSettingsWidget::ConsoleSettingsWidget(SettingsWindow* dialog, QWidget* parent)
-  : QWidget(parent), m_dialog(dialog)
+ConsoleSettingsWidget::ConsoleSettingsWidget(QtHostInterface* host_interface, QWidget* parent, SettingsDialog* dialog)
+  : QWidget(parent), m_host_interface(host_interface)
 {
-  SettingsInterface* sif = dialog->getSettingsInterface();
-
   m_ui.setupUi(this);
 
-  SettingWidgetBinder::BindWidgetToEnumSetting(sif, m_ui.region, "Console", "Region", &Settings::ParseConsoleRegionName,
-                                               &Settings::GetConsoleRegionName, &Settings::GetConsoleRegionDisplayName,
-                                               Settings::DEFAULT_CONSOLE_REGION, ConsoleRegion::Count,
-                                               &QtUtils::GetIconForRegion);
-  SettingWidgetBinder::BindWidgetToEnumSetting(
-    sif, m_ui.forceVideoTiming, "GPU", "ForceVideoTiming", &Settings::ParseForceVideoTimingName,
-    &Settings::GetForceVideoTimingName, &Settings::GetForceVideoTimingDisplayName,
-    Settings::DEFAULT_FORCE_VIDEO_TIMING_MODE, ForceVideoTimingMode::Count, +[](ForceVideoTimingMode mode) {
-      return QtUtils::GetIconForRegion(
-        (mode == ForceVideoTimingMode::Disabled) ?
-          ConsoleRegion::Auto :
-          ((mode == ForceVideoTimingMode::NTSC) ? ConsoleRegion::NTSC_U : ConsoleRegion::PAL));
-    });
-  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.fastBoot, "BIOS", "PatchFastBoot", false);
-  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.fastForwardBoot, "BIOS", "FastForwardBoot", false);
-  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.enable8MBRAM, "Console", "Enable8MBRAM", false);
-  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.fastForwardMemoryCardAccess, "MemoryCards",
-                                               "FastForwardAccess", false);
-  connect(m_ui.fastBoot, &QCheckBox::checkStateChanged, this, &ConsoleSettingsWidget::onFastBootChanged);
-  onFastBootChanged();
+  for (u32 i = 0; i < static_cast<u32>(ConsoleRegion::Count); i++)
+  {
+    m_ui.region->addItem(
+      qApp->translate("ConsoleRegion", Settings::GetConsoleRegionDisplayName(static_cast<ConsoleRegion>(i))));
+  }
 
-  SettingWidgetBinder::BindWidgetToEnumSetting(sif, m_ui.cpuExecutionMode, "CPU", "ExecutionMode",
+  for (u32 i = 0; i < static_cast<u32>(CPUExecutionMode::Count); i++)
+  {
+    m_ui.cpuExecutionMode->addItem(
+      qApp->translate("CPUExecutionMode", Settings::GetCPUExecutionModeDisplayName(static_cast<CPUExecutionMode>(i))));
+  }
+
+  for (u32 i = 0; i < static_cast<u32>(MultitapMode::Count); i++)
+  {
+    m_ui.multitapMode->addItem(
+      qApp->translate("MultitapMode", Settings::GetMultitapModeDisplayName(static_cast<MultitapMode>(i))));
+  }
+
+  SettingWidgetBinder::BindWidgetToEnumSetting(m_host_interface, m_ui.region, "Console", "Region",
+                                               &Settings::ParseConsoleRegionName, &Settings::GetConsoleRegionName,
+                                               Settings::DEFAULT_CONSOLE_REGION);
+  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.enable8MBRAM, "Console", "Enable8MBRAM", false);
+  SettingWidgetBinder::BindWidgetToEnumSetting(m_host_interface, m_ui.cpuExecutionMode, "CPU", "ExecutionMode",
                                                &Settings::ParseCPUExecutionMode, &Settings::GetCPUExecutionModeName,
-                                               &Settings::GetCPUExecutionModeDisplayName,
-                                               Settings::DEFAULT_CPU_EXECUTION_MODE, CPUExecutionMode::Count);
-  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.enableCPUClockSpeedControl, "CPU", "OverclockEnable", false);
-  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.recompilerICache, "CPU", "RecompilerICache", false);
-  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.cdromLoadImageToRAM, "CDROM", "LoadImageToRAM", false);
-  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.cdromAutoDiscChange, "CDROM", "AutoDiscChange", false);
-
-  if (!m_dialog->isPerGameSettings())
-  {
-    SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.cdromLoadImagePatches, "CDROM", "LoadImagePatches", false);
-    SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.cdromIgnoreDriveSubcode, "CDROM", "IgnoreHostSubcode",
-                                                 false);
-  }
-  else
-  {
-    m_ui.cdromGridLayout->removeWidget(m_ui.cdromIgnoreDriveSubcode);
-    delete m_ui.cdromIgnoreDriveSubcode;
-    m_ui.cdromIgnoreDriveSubcode = nullptr;
-    m_ui.cdromGridLayout->removeWidget(m_ui.cdromLoadImagePatches);
-    delete m_ui.cdromLoadImagePatches;
-    m_ui.cdromLoadImagePatches = nullptr;
-  }
-
-  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.cdromSeekSpeedup, "CDROM", "SeekSpeedup", 1,
-                                              CDROM_SPEEDUP_VALUES);
-  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.cdromReadSpeedup, "CDROM", "ReadSpeedup", 1,
-                                              CDROM_SPEEDUP_VALUES);
+                                               Settings::DEFAULT_CPU_EXECUTION_MODE);
+  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.enableCPUClockSpeedControl, "CPU",
+                                               "OverclockEnable", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.cdromReadThread, "CDROM", "ReadThread", true);
+  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.cdromRegionCheck, "CDROM", "RegionCheck", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.cdromLoadImageToRAM, "CDROM", "LoadImageToRAM",
+                                               false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.cdromLoadImagePatches, "CDROM",
+                                               "LoadImagePatches", false);
+  SettingWidgetBinder::BindWidgetToIntSetting(m_host_interface, m_ui.cdromSeekSpeedup, "CDROM", "SeekSpeedup", 1);
+  SettingWidgetBinder::BindWidgetToEnumSetting(m_host_interface, m_ui.multitapMode, "ControllerPorts", "MultitapMode",
+                                               &Settings::ParseMultitapModeName, &Settings::GetMultitapModeName,
+                                               Settings::DEFAULT_MULTITAP_MODE);
 
   dialog->registerWidgetHelp(m_ui.region, tr("Region"), tr("Auto-Detect"),
                              tr("Determines the emulated hardware type."));
-  dialog->registerWidgetHelp(
-    m_ui.forceVideoTiming, tr("Frame Rate"), tr("Auto-Detect"),
-    tr("Utilizes the chosen frame timing regardless of the active region. This feature can be used to force PAL games "
-       "to run at 60Hz and NTSC games to run at 50Hz. For most games which have a speed tied to the framerate, this "
-       "will result in the game running approximately 17% faster or slower. For variable frame rate games, it may not "
-       "affect the speed."));
-  m_dialog->registerWidgetHelp(m_ui.fastBoot, tr("Fast Boot"), tr("Unchecked"),
-                               tr("Skips the boot animation. Safe to enable."));
-  m_dialog->registerWidgetHelp(m_ui.fastForwardBoot, tr("Fast Forward Boot"), tr("Unchecked"),
-                               tr("Fast forwards through the early loading process when fast booting, saving time. "
-                                  "Results may vary between games."));
-  m_dialog->registerWidgetHelp(m_ui.fastForwardMemoryCardAccess, tr("Fast Forward Memory Card Access"), tr("Unchecked"),
-                               tr("Fast forwards through memory card access, both loading and saving. Can reduce "
-                                  "waiting times in games that frequently access memory cards."));
-  dialog->registerWidgetHelp(
-    m_ui.enable8MBRAM, tr("Enable 8MB RAM (Dev Console)"), tr("Unchecked"),
-    tr("Enables an additional 6MB of RAM to obtain a total of 2+6 = 8MB, usually present on dev consoles. Games have "
-       "to use a larger heap size for "
-       "this additional RAM to be usable. Titles which rely on memory mirrors may break, so it should only be used "
-       "with compatible mods."));
-
   dialog->registerWidgetHelp(m_ui.cpuExecutionMode, tr("Execution Mode"), tr("Recompiler (Fastest)"),
                              tr("Determines how the emulated CPU executes instructions."));
   dialog->registerWidgetHelp(m_ui.enableCPUClockSpeedControl,
@@ -106,11 +57,15 @@ ConsoleSettingsWidget::ConsoleSettingsWidget(SettingsWindow* dialog, QWidget* pa
                              tr("When this option is chosen, the clock speed set below will be used."));
   dialog->registerWidgetHelp(m_ui.cpuClockSpeed, tr("Overclocking Percentage"), tr("100%"),
                              tr("Selects the percentage of the normal clock speed the emulated hardware will run at."));
-  dialog->registerWidgetHelp(m_ui.recompilerICache, tr("Enable Recompiler ICache"), tr("Unchecked"),
-                             tr("Simulates stalls in the recompilers when the emulated CPU would have to fetch "
-                                "instructions into its cache. Makes games run closer to their console framerate, at a "
-                                "small cost to performance. Interpreter mode always simulates the instruction cache."));
-
+  dialog->registerWidgetHelp(
+    m_ui.enable8MBRAM, tr("Enable 8MB RAM (Dev Console)"), tr("Unchecked"),
+    tr("Enables an additional 6MB of RAM, usually present on dev consoles. Games have to use a larger heap size for "
+       "this additional RAM to be usable, and may break games which rely on memory mirrors, so it should only be used "
+       "with compatible mods."));
+  dialog->registerWidgetHelp(
+    m_ui.cdromLoadImageToRAM, tr("Preload Image to RAM"), tr("Unchecked"),
+    tr("Loads the game image into RAM. Useful for network paths that may become unreliable during gameplay. In some "
+       "cases also eliminates stutter when games initiate audio track playback."));
   dialog->registerWidgetHelp(
     m_ui.cdromReadSpeedup, tr("CD-ROM Read Speedup"), tr("None (Double Speed)"),
     tr("Speeds up CD-ROM reads by the specified factor. Only applies to double-speed reads, and is ignored when audio "
@@ -120,6 +75,11 @@ ConsoleSettingsWidget::ConsoleSettingsWidget(SettingsWindow* dialog, QWidget* pa
     tr("Reduces the simulated time for the CD-ROM sled to move to different areas of the disc. Can improve loading "
        "times, but crash games which do not expect the CD-ROM to operate faster."));
   dialog->registerWidgetHelp(
+    m_ui.cdromReadThread, tr("Use Read Thread (Asynchronous)"), tr("Checked"),
+    tr("Reduces hitches in emulation by reading/decompressing CD data asynchronously on a worker thread."));
+  dialog->registerWidgetHelp(m_ui.cdromRegionCheck, tr("Enable Region Check"), tr("Checked"),
+                             tr("Simulates the region check present in original, unmodified consoles."));
+  dialog->registerWidgetHelp(
     m_ui.cdromLoadImageToRAM, tr("Preload Image to RAM"), tr("Unchecked"),
     tr("Loads the game image into RAM. Useful for network paths that may become unreliable during gameplay. In some "
        "cases also eliminates stutter when games initiate audio track playback."));
@@ -127,101 +87,50 @@ ConsoleSettingsWidget::ConsoleSettingsWidget(SettingsWindow* dialog, QWidget* pa
                              tr("Automatically applies patches to disc images when they are present in the same "
                                 "directory. Currently only PPF patches are supported with this option."));
   dialog->registerWidgetHelp(
-    m_ui.cdromAutoDiscChange, tr("Switch to Next Disc on Stop"), tr("Unchecked"),
-    tr("Automatically switches to the next disc in the game when the game stops the CD-ROM motor. No switch will occur "
-       "if the last disc in the game is already selected. <strong>Does not work for all games.</strong>"));
-  dialog->registerWidgetHelp(
-    m_ui.cdromIgnoreDriveSubcode, tr("Ignore Drive Subcode"), tr("Unchecked"),
-    tr("Ignores the subchannel provided by the drive when using physical discs, instead always generating subchannel "
-       "data. Won't work with libcrypt games, but can improve read reliability on some drives."));
+    m_ui.multitapMode, tr("Multitap"), tr("Disabled"),
+    tr("Enables multitap support on specified controller ports. Leave disabled for games that do "
+       "not support multitap input."));
 
-  m_ui.cpuClockSpeed->setEnabled(m_dialog->getEffectiveBoolValue("CPU", "OverclockEnable", false));
+  m_ui.cpuClockSpeed->setEnabled(m_ui.enableCPUClockSpeedControl->checkState() == Qt::Checked);
+  m_ui.cdromReadSpeedup->setCurrentIndex(m_host_interface->GetIntSettingValue("CDROM", "ReadSpeedup", 1) - 1);
 
-  connect(m_ui.enableCPUClockSpeedControl, &QCheckBox::checkStateChanged, this,
+  connect(m_ui.enableCPUClockSpeedControl, &QCheckBox::stateChanged, this,
           &ConsoleSettingsWidget::onEnableCPUClockSpeedControlChecked);
   connect(m_ui.cpuClockSpeed, &QSlider::valueChanged, this, &ConsoleSettingsWidget::onCPUClockSpeedValueChanged);
-
-  SettingWidgetBinder::SetAvailability(m_ui.fastBoot, !m_dialog->hasGameTrait(GameDatabase::Trait::ForceFullBoot));
-  SettingWidgetBinder::SetAvailability(m_ui.fastForwardBoot,
-                                       !m_dialog->hasGameTrait(GameDatabase::Trait::ForceFullBoot));
-  SettingWidgetBinder::SetAvailability(
-    m_ui.fastForwardMemoryCardAccess, !m_dialog->hasGameTrait(GameDatabase::Trait::DisableFastForwardMemoryCardAccess));
-  SettingWidgetBinder::SetAvailability(
-    m_ui.cpuExecutionMode, !m_dialog->hasGameTrait(GameDatabase::Trait::ForceInterpreter), m_ui.cpuExecutionModeLabel);
-  SettingWidgetBinder::SetAvailability(m_ui.cdromReadSpeedup,
-                                       !m_dialog->hasGameTrait(GameDatabase::Trait::DisableCDROMReadSpeedup),
-                                       m_ui.cdromReadSpeedupLabel);
-  SettingWidgetBinder::SetAvailability(m_ui.cdromSeekSpeedup,
-                                       !m_dialog->hasGameTrait(GameDatabase::Trait::DisableCDROMSeekSpeedup),
-                                       m_ui.cdromSeekSpeedupLabel);
-  SettingWidgetBinder::SetForceEnabled(m_ui.recompilerICache,
-                                       m_dialog->hasGameTrait(GameDatabase::Trait::ForceRecompilerICache));
+  connect(m_ui.cdromReadSpeedup, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+          &ConsoleSettingsWidget::onCDROMReadSpeedupValueChanged);
+  connect(m_ui.multitapMode, QOverload<int>::of(&QComboBox::currentIndexChanged),
+          [this](int index) { emit multitapModeChanged(); });
 
   calculateCPUClockValue();
 }
 
 ConsoleSettingsWidget::~ConsoleSettingsWidget() = default;
 
-void ConsoleSettingsWidget::onFastBootChanged()
-{
-  const bool fast_boot_enabled =
-    m_dialog->getEffectiveBoolValue("BIOS", "PatchFastBoot", Settings::DEFAULT_FAST_BOOT_VALUE);
-  m_ui.fastForwardBoot->setEnabled(fast_boot_enabled);
-}
-
-void ConsoleSettingsWidget::updateRecompilerICacheEnabled()
-{
-  const CPUExecutionMode mode =
-    Settings::ParseCPUExecutionMode(
-      m_dialog
-        ->getEffectiveStringValue("CPU", "ExecutionMode",
-                                  Settings::GetCPUExecutionModeName(Settings::DEFAULT_CPU_EXECUTION_MODE))
-        .c_str())
-      .value_or(Settings::DEFAULT_CPU_EXECUTION_MODE);
-  m_ui.recompilerICache->setEnabled(mode != CPUExecutionMode::Interpreter &&
-                                    !m_dialog->hasGameTrait(GameDatabase::Trait::ForceRecompilerICache));
-}
-
 void ConsoleSettingsWidget::onEnableCPUClockSpeedControlChecked(int state)
 {
-  if (state == Qt::Checked &&
-      (!m_dialog->isPerGameSettings() || !Core::GetBaseBoolSettingValue("CPU", "OverclockEnable", false)) &&
-      !Core::GetBaseBoolSettingValue("UI", "CPUOverclockingWarningShown", false))
+  if (state == Qt::Checked && !m_host_interface->GetBoolSettingValue("UI", "CPUOverclockingWarningShown", false))
   {
     const QString message =
       tr("Enabling CPU overclocking will break games, cause bugs, reduce performance and can significantly increase "
          "system requirements.\n\nBy enabling this option you are agreeing to not create any bug reports unless you "
          "have confirmed the bug also occurs with overclocking disabled.\n\nThis warning will only be shown once.");
+    const QString yes_button = tr("Yes, I will confirm bugs without overclocking before reporting.");
+    const QString no_button = tr("No, take me back to safety.");
 
-    QMessageBox* const mb = QtUtils::NewMessageBox(this, QMessageBox::Warning, tr("CPU Overclocking Warning"), message,
-                                                   QMessageBox::NoButton, QMessageBox::NoButton);
-    const QPushButton* const yes_button =
-      mb->addButton(tr("Yes, I will confirm bugs without overclocking before reporting."), QMessageBox::YesRole);
-    const QPushButton* const no_button = mb->addButton(tr("No, take me back to safety."), QMessageBox::NoRole);
-    connect(no_button, &QPushButton::clicked, this, [this]() {
+    if (QMessageBox::question(QtUtils::GetRootWidget(this), tr("CPU Overclocking Warning"), message, yes_button,
+                              no_button) != 0)
+    {
       QSignalBlocker sb(m_ui.enableCPUClockSpeedControl);
-      if (m_dialog->isPerGameSettings())
-      {
-        m_ui.enableCPUClockSpeedControl->setCheckState(Qt::PartiallyChecked);
-        m_dialog->removeSettingValue("CPU", "OverclockEnable");
-      }
-      else
-      {
-        m_ui.enableCPUClockSpeedControl->setCheckState(Qt::Unchecked);
-        m_dialog->setBoolSettingValue("CPU", "OverclockEnable", false);
-      }
+      m_ui.enableCPUClockSpeedControl->setChecked(Qt::Unchecked);
+      m_host_interface->SetBoolSettingValue("CPU", "OverclockEnable", false);
+      return;
+    }
 
-      m_ui.cpuClockSpeed->setEnabled(m_dialog->getEffectiveBoolValue("CPU", "OverclockEnable", false));
-      updateCPUClockSpeedLabel();
-    });
-    connect(yes_button, &QPushButton::clicked, this, []() {
-      Core::SetBaseBoolSettingValue("UI", "CPUOverclockingWarningShown", true);
-      Host::CommitBaseSettingChanges();
-    });
-    mb->open();
+    m_host_interface->SetBoolSettingValue("UI", "CPUOverclockingWarningShown", true);
   }
 
-  m_ui.cpuClockSpeed->setEnabled(m_dialog->getEffectiveBoolValue("CPU", "OverclockEnable", false));
+  m_ui.cpuClockSpeed->setEnabled(state == Qt::Checked);
   updateCPUClockSpeedLabel();
 }
 
@@ -230,9 +139,10 @@ void ConsoleSettingsWidget::onCPUClockSpeedValueChanged(int value)
   const u32 percent = static_cast<u32>(m_ui.cpuClockSpeed->value());
   u32 numerator, denominator;
   Settings::CPUOverclockPercentToFraction(percent, &numerator, &denominator);
-  m_dialog->setIntSettingValue("CPU", "OverclockNumerator", static_cast<int>(numerator));
-  m_dialog->setIntSettingValue("CPU", "OverclockDenominator", static_cast<int>(denominator));
+  m_host_interface->SetIntSettingValue("CPU", "OverclockNumerator", static_cast<int>(numerator));
+  m_host_interface->SetIntSettingValue("CPU", "OverclockDenominator", static_cast<int>(denominator));
   updateCPUClockSpeedLabel();
+  m_host_interface->applySettings();
 }
 
 void ConsoleSettingsWidget::updateCPUClockSpeedLabel()
@@ -242,10 +152,16 @@ void ConsoleSettingsWidget::updateCPUClockSpeedLabel()
   m_ui.cpuClockSpeedLabel->setText(tr("%1% (%2MHz)").arg(percent).arg(frequency / 1000000.0, 0, 'f', 2));
 }
 
+void ConsoleSettingsWidget::onCDROMReadSpeedupValueChanged(int value)
+{
+  m_host_interface->SetIntSettingValue("CDROM", "ReadSpeedup", value + 1);
+  m_host_interface->applySettings();
+}
+
 void ConsoleSettingsWidget::calculateCPUClockValue()
 {
-  const u32 numerator = static_cast<u32>(m_dialog->getEffectiveIntValue("CPU", "OverclockNumerator", 1));
-  const u32 denominator = static_cast<u32>(m_dialog->getEffectiveIntValue("CPU", "OverclockDenominator", 1));
+  const u32 numerator = static_cast<u32>(m_host_interface->GetIntSettingValue("CPU", "OverclockNumerator", 1));
+  const u32 denominator = static_cast<u32>(m_host_interface->GetIntSettingValue("CPU", "OverclockDenominator", 1));
   const u32 percent = Settings::CPUOverclockFractionToPercent(numerator, denominator);
   QSignalBlocker sb(m_ui.cpuClockSpeed);
   m_ui.cpuClockSpeed->setValue(static_cast<int>(percent));

@@ -6,9 +6,12 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>600</width>
-    <height>487</height>
+    <width>648</width>
+    <height>456</height>
    </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Form</string>
   </property>
   <layout class="QVBoxLayout" name="verticalLayout">
    <property name="leftMargin">
@@ -28,7 +31,7 @@
      <property name="title">
       <string>Console</string>
      </property>
-     <layout class="QGridLayout" name="gridLayout_3" columnstretch="0,1">
+     <layout class="QFormLayout" name="formLayout">
       <item row="0" column="0">
        <widget class="QLabel" name="label">
         <property name="text">
@@ -39,47 +42,12 @@
       <item row="0" column="1">
        <widget class="QComboBox" name="region"/>
       </item>
-      <item row="1" column="0">
-       <widget class="QLabel" name="forceVideoTimingLabel">
+      <item row="1" column="0" colspan="2">
+       <widget class="QCheckBox" name="enable8MBRAM">
         <property name="text">
-         <string>Frame Rate:</string>
+         <string>Enable 8MB RAM (Dev Console)</string>
         </property>
        </widget>
-      </item>
-      <item row="1" column="1">
-       <widget class="QComboBox" name="forceVideoTiming"/>
-      </item>
-      <item row="2" column="0" colspan="2">
-       <layout class="QGridLayout" name="gridLayout_2">
-        <item row="0" column="0">
-         <widget class="QCheckBox" name="fastBoot">
-          <property name="text">
-           <string>Fast Boot</string>
-          </property>
-         </widget>
-        </item>
-        <item row="0" column="1">
-         <widget class="QCheckBox" name="fastForwardMemoryCardAccess">
-          <property name="text">
-           <string>Fast Forward Memory Card Access</string>
-          </property>
-         </widget>
-        </item>
-        <item row="1" column="0">
-         <widget class="QCheckBox" name="fastForwardBoot">
-          <property name="text">
-           <string>Fast Forward Boot</string>
-          </property>
-         </widget>
-        </item>
-        <item row="1" column="1">
-         <widget class="QCheckBox" name="enable8MBRAM">
-          <property name="text">
-           <string>Enable 8MB RAM (Dev Console)</string>
-          </property>
-         </widget>
-        </item>
-       </layout>
       </item>
      </layout>
     </widget>
@@ -89,9 +57,9 @@
      <property name="title">
       <string>CPU Emulation</string>
      </property>
-     <layout class="QGridLayout" name="gridLayout_4" columnstretch="0,1">
+     <layout class="QFormLayout" name="formLayout_3">
       <item row="0" column="0">
-       <widget class="QLabel" name="cpuExecutionModeLabel">
+       <widget class="QLabel" name="label_3">
         <property name="text">
          <string>Execution Mode:</string>
         </property>
@@ -101,85 +69,76 @@
        <widget class="QComboBox" name="cpuExecutionMode"/>
       </item>
       <item row="1" column="0" colspan="2">
-       <layout class="QHBoxLayout" name="horizontalLayout">
+       <layout class="QVBoxLayout" name="verticalLayout_2">
         <item>
-         <widget class="QCheckBox" name="enableCPUClockSpeedControl">
-          <property name="text">
-           <string>Enable Clock Speed Control (Overclocking/Underclocking)</string>
-          </property>
-         </widget>
+         <layout class="QHBoxLayout" name="horizontalLayout">
+          <item>
+           <widget class="QCheckBox" name="enableCPUClockSpeedControl">
+            <property name="text">
+             <string>Enable Clock Speed Control (Overclocking/Underclocking)</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="horizontalSpacer">
+            <property name="orientation">
+             <enum>Qt::Horizontal</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>40</width>
+              <height>20</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+          <item>
+           <widget class="QLabel" name="cpuClockSpeedLabel">
+            <property name="text">
+             <string>100% (effective 33.3mhz)</string>
+            </property>
+            <property name="alignment">
+             <set>Qt::AlignCenter</set>
+            </property>
+           </widget>
+          </item>
+         </layout>
         </item>
         <item>
-         <spacer name="horizontalSpacer">
+         <widget class="QSlider" name="cpuClockSpeed">
+          <property name="minimum">
+           <number>10</number>
+          </property>
+          <property name="maximum">
+           <number>1000</number>
+          </property>
+          <property name="value">
+           <number>100</number>
+          </property>
           <property name="orientation">
-           <enum>Qt::Orientation::Horizontal</enum>
+           <enum>Qt::Horizontal</enum>
           </property>
-          <property name="sizeHint" stdset="0">
-           <size>
-            <width>40</width>
-            <height>20</height>
-           </size>
+          <property name="tickPosition">
+           <enum>QSlider::TicksBothSides</enum>
           </property>
-         </spacer>
-        </item>
-        <item>
-         <widget class="QLabel" name="cpuClockSpeedLabel">
-          <property name="text">
-           <string>100% (33.87MHz)</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignmentFlag::AlignCenter</set>
+          <property name="tickInterval">
+           <number>50</number>
           </property>
          </widget>
         </item>
        </layout>
       </item>
-      <item row="2" column="0" colspan="2">
-       <widget class="QSlider" name="cpuClockSpeed">
-        <property name="minimum">
-         <number>10</number>
-        </property>
-        <property name="maximum">
-         <number>1000</number>
-        </property>
-        <property name="singleStep">
-         <number>5</number>
-        </property>
-        <property name="pageStep">
-         <number>50</number>
-        </property>
-        <property name="value">
-         <number>100</number>
-        </property>
-        <property name="orientation">
-         <enum>Qt::Orientation::Horizontal</enum>
-        </property>
-        <property name="tickPosition">
-         <enum>QSlider::TickPosition::TicksBelow</enum>
-        </property>
-        <property name="tickInterval">
-         <number>50</number>
-        </property>
-       </widget>
-      </item>
-      <item row="3" column="0" colspan="2">
-       <widget class="QCheckBox" name="recompilerICache">
-        <property name="text">
-         <string>Enable Recompiler ICache</string>
-        </property>
-       </widget>
-      </item>
      </layout>
     </widget>
    </item>
    <item>
-    <widget class="QGroupBox" name="cdromGroup">
+    <widget class="QGroupBox" name="groupBox_4">
      <property name="title">
       <string>CD-ROM Emulation</string>
      </property>
-     <layout class="QGridLayout" name="cdromLayout" columnstretch="0,1">
+     <layout class="QFormLayout" name="formLayout_4">
       <item row="0" column="0">
-       <widget class="QLabel" name="cdromReadSpeedupLabel">
+       <widget class="QLabel" name="label_2">
         <property name="text">
          <string>Read Speedup:</string>
         </property>
@@ -219,13 +178,60 @@
         </item>
         <item>
          <property name="text">
-          <string>Maximum (Safer)</string>
+          <string>7x (14x Speed)</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>8x (16x Speed)</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>9x (18x Speed)</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>10x (20x Speed)</string>
          </property>
         </item>
        </widget>
       </item>
+      <item row="2" column="0" colspan="2">
+       <layout class="QGridLayout" name="gridLayout">
+        <item row="0" column="0">
+         <widget class="QCheckBox" name="cdromReadThread">
+          <property name="text">
+           <string>Use Read Thread (Asynchronous)</string>
+          </property>
+         </widget>
+        </item>
+        <item row="0" column="1">
+         <widget class="QCheckBox" name="cdromRegionCheck">
+          <property name="text">
+           <string>Enable Region Check</string>
+          </property>
+         </widget>
+        </item>
+        <item row="1" column="0">
+         <widget class="QCheckBox" name="cdromLoadImageToRAM">
+          <property name="text">
+           <string>Preload Image To RAM</string>
+          </property>
+         </widget>
+        </item>
+        <item row="1" column="1">
+         <widget class="QCheckBox" name="cdromLoadImagePatches">
+          <property name="text">
+           <string>Apply Image Patches</string>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
       <item row="1" column="0">
-       <widget class="QLabel" name="cdromSeekSpeedupLabel">
+       <widget class="QLabel" name="label_5">
         <property name="text">
          <string>Seek Speedup:</string>
         </property>
@@ -233,9 +239,14 @@
       </item>
       <item row="1" column="1">
        <widget class="QComboBox" name="cdromSeekSpeedup">
-        <property name="currentText">
-         <string>None (Normal Speed)</string>
+        <property name="currentIndex">
+         <number>1</number>
         </property>
+        <item>
+         <property name="text">
+          <string>Infinite/Instantaneous</string>
+         </property>
+        </item>
         <item>
          <property name="text">
           <string>None (Normal Speed)</string>
@@ -268,42 +279,44 @@
         </item>
         <item>
          <property name="text">
-          <string>Maximum (Safer)</string>
+          <string>7x</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>8x</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>9x</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>10x</string>
          </property>
         </item>
        </widget>
       </item>
-      <item row="2" column="0" colspan="2">
-       <layout class="QGridLayout" name="cdromGridLayout">
-        <item row="0" column="0">
-         <widget class="QCheckBox" name="cdromLoadImageToRAM">
-          <property name="text">
-           <string>Preload Image To RAM</string>
-          </property>
-         </widget>
-        </item>
-        <item row="1" column="1">
-         <widget class="QCheckBox" name="cdromIgnoreDriveSubcode">
-          <property name="text">
-           <string>Ignore Drive Subcode</string>
-          </property>
-         </widget>
-        </item>
-        <item row="1" column="0">
-         <widget class="QCheckBox" name="cdromLoadImagePatches">
-          <property name="text">
-           <string>Apply Image Patches</string>
-          </property>
-         </widget>
-        </item>
-        <item row="0" column="1">
-         <widget class="QCheckBox" name="cdromAutoDiscChange">
-          <property name="text">
-           <string>Switch to Next Disc on Stop</string>
-          </property>
-         </widget>
-        </item>
-       </layout>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="groupBox_3">
+     <property name="title">
+      <string>Controller Ports</string>
+     </property>
+     <layout class="QFormLayout" name="formLayout_2">
+      <item row="0" column="0">
+       <widget class="QLabel" name="label_4">
+        <property name="text">
+         <string>Multitap:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QComboBox" name="multitapMode"/>
       </item>
      </layout>
     </widget>
@@ -311,12 +324,12 @@
    <item>
     <spacer name="verticalSpacer">
      <property name="orientation">
-      <enum>Qt::Orientation::Vertical</enum>
+      <enum>Qt::Vertical</enum>
      </property>
      <property name="sizeHint" stdset="0">
       <size>
-       <width>0</width>
-       <height>0</height>
+       <width>20</width>
+       <height>40</height>
       </size>
      </property>
     </spacer>
@@ -324,7 +337,7 @@
   </layout>
  </widget>
  <resources>
-  <include location="resources/duckstation-qt.qrc"/>
+  <include location="resources/resources.qrc"/>
  </resources>
  <connections/>
 </ui>

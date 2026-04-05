@@ -1,38 +1,36 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #pragma once
-#include "common/types.h"
-#include "util/input_manager.h"
+#include "core/controller.h"
+#include "core/types.h"
 #include <QtWidgets/QPushButton>
 #include <optional>
 
 class QTimer;
 
-class ControllerSettingsWindow;
-class SettingsInterface;
+class QtHostInterface;
 
 class InputBindingWidget : public QPushButton
 {
   Q_OBJECT
 
 public:
-  explicit InputBindingWidget(QWidget* parent);
-  InputBindingWidget(QWidget* parent, SettingsInterface* sif, InputBindingInfo::Type bind_type,
-                     std::string section_name, std::string key_name);
+  InputBindingWidget(QtHostInterface* host_interface, std::string section_name, std::string key_name, QWidget* parent);
   ~InputBindingWidget();
 
-  static bool isMouseMappingEnabled();
-  static bool isSensorMappingEnabled();
-  static bool isSensorBinding(InputBindingKey key);
-  static void logInputEvent(InputBindingInfo::Type bind_type, InputBindingKey key, float value, float initial_value,
-                            float min_value);
+  ALWAYS_INLINE InputBindingWidget* getNextWidget() const { return m_next_widget; }
+  ALWAYS_INLINE void setNextWidget(InputBindingWidget* widget) { m_next_widget = widget; }
 
-  void initialize(SettingsInterface* sif, InputBindingInfo::Type bind_type, std::string section_name,
-                  std::string key_name);
-
+public Q_SLOTS:
+  void bindToControllerAxis(int controller_index, int axis_index, bool inverted,
+                            std::optional<bool> half_axis_positive);
+  void bindToControllerButton(int controller_index, int button_index);
+  void bindToControllerHat(int controller_index, int hat_index, const QString& hat_direction);
+  void beginRebindAll();
   void clearBinding();
   void reloadBinding();
+
+protected Q_SLOTS:
+  void onClicked();
+  void onInputListenTimerTimeout();
 
 protected:
   enum : u32
@@ -44,7 +42,6 @@ protected:
   virtual bool eventFilter(QObject* watched, QEvent* event) override;
   virtual bool event(QEvent* event) override;
   virtual void mouseReleaseEvent(QMouseEvent* e) override;
-  virtual void resizeEvent(QResizeEvent* e) override;
 
   virtual void startListeningForInput(u32 timeout_in_seconds);
   virtual void stopListeningForInput();
@@ -52,31 +49,73 @@ protected:
 
   bool isListeningForInput() const { return m_input_listen_timer != nullptr; }
   void setNewBinding();
-  void updateElidedText();
-  void updateTextAndToolTip();
+  void updateText();
 
-  void hookInputManager();
-  void unhookInputManager();
-
-  void onClicked();
-  void onInputListenTimerTimeout();
-  void inputManagerHookCallback(InputBindingKey key, float value);
-
-  void showEffectBindingDialog();
-
-  SettingsInterface* m_sif = nullptr;
-  InputBindingInfo::Type m_bind_type = InputBindingInfo::Type::Unknown;
+  QtHostInterface* m_host_interface;
   std::string m_section_name;
   std::string m_key_name;
   std::vector<std::string> m_bindings;
-  std::vector<InputBindingKey> m_new_bindings;
-  std::vector<std::pair<InputBindingKey, std::pair<float, float>>> m_value_ranges;
-  QString m_full_text;
+  std::string m_new_binding_value;
   QTimer* m_input_listen_timer = nullptr;
   u32 m_input_listen_remaining_seconds = 0;
-  QPoint m_input_listen_start_position{};
-  bool m_mouse_mapping_enabled = false;
-  bool m_sensor_mapping_enabled = false;
 
-  static InputBindingWidget* s_current_hook_widget;
+  InputBindingWidget* m_next_widget = nullptr;
+  bool m_is_binding_all = false;
+};
+
+class InputButtonBindingWidget : public InputBindingWidget
+{
+  Q_OBJECT
+
+public:
+  InputButtonBindingWidget(QtHostInterface* host_interface, std::string section_name, std::string key_name,
+                           QWidget* parent);
+  ~InputButtonBindingWidget();
+
+protected:
+  void startListeningForInput(u32 timeout_in_seconds) override;
+  void stopListeningForInput() override;
+  void openDialog() override;
+  void hookControllerInput();
+  void unhookControllerInput();
+};
+
+class InputAxisBindingWidget : public InputBindingWidget
+{
+  Q_OBJECT
+
+public:
+  InputAxisBindingWidget(QtHostInterface* host_interface, std::string section_name, std::string key_name,
+                         Controller::AxisType axis_type, QWidget* parent);
+  ~InputAxisBindingWidget();
+
+protected:
+  bool eventFilter(QObject* watched, QEvent* event) override;
+  void startListeningForInput(u32 timeout_in_seconds) override;
+  void stopListeningForInput() override;
+  void openDialog() override;
+  void hookControllerInput();
+  void unhookControllerInput();
+
+private:
+  Controller::AxisType m_axis_type;
+};
+
+class InputRumbleBindingWidget : public InputBindingWidget
+{
+  Q_OBJECT
+
+public:
+  InputRumbleBindingWidget(QtHostInterface* host_interface, std::string section_name, std::string key_name,
+                           QWidget* parent);
+  ~InputRumbleBindingWidget();
+
+private Q_SLOTS:
+  void bindToControllerRumble(int controller_index);
+
+protected:
+  void startListeningForInput(u32 timeout_in_seconds) override;
+  void stopListeningForInput() override;
+  void hookControllerInput();
+  void unhookControllerInput();
 };

@@ -1,32 +1,33 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #pragma once
 
 #include <QtWidgets/QWidget>
 
 #include "ui_consolesettingswidget.h"
 
-class SettingsWindow;
+class QtHostInterface;
+class SettingsDialog;
 
 class ConsoleSettingsWidget : public QWidget
 {
   Q_OBJECT
 
 public:
-  explicit ConsoleSettingsWidget(SettingsWindow* dialog, QWidget* parent);
+  explicit ConsoleSettingsWidget(QtHostInterface* host_interface, QWidget* parent, SettingsDialog* dialog);
   ~ConsoleSettingsWidget();
+
+Q_SIGNALS:
+  void multitapModeChanged();
+
+private Q_SLOTS:
+  void onEnableCPUClockSpeedControlChecked(int state);
+  void onCPUClockSpeedValueChanged(int value);
+  void updateCPUClockSpeedLabel();
+  void onCDROMReadSpeedupValueChanged(int value);
 
 private:
   void calculateCPUClockValue();
 
-  void onFastBootChanged();
-  void updateRecompilerICacheEnabled();
-  void onEnableCPUClockSpeedControlChecked(int state);
-  void onCPUClockSpeedValueChanged(int value);
-  void updateCPUClockSpeedLabel();
-
   Ui::ConsoleSettingsWidget m_ui;
 
-  SettingsWindow* m_dialog;
+  QtHostInterface* m_host_interface;
 };

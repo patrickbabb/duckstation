@@ -1,29 +1,32 @@
-// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #pragma once
-
-#include "ui_inputbindingdialog.h"
-
-#include "util/input_manager.h"
-
 #include "common/types.h"
-
+#include "core/controller.h"
+#include "ui_inputbindingdialog.h"
 #include <QtWidgets/QDialog>
 #include <optional>
 #include <string>
 #include <vector>
 
-class SettingsInterface;
+class QtHostInterface;
 
 class InputBindingDialog : public QDialog
 {
   Q_OBJECT
 
 public:
-  InputBindingDialog(SettingsInterface* sif, InputBindingInfo::Type bind_type, std::string section_name,
-                     std::string key_name, std::vector<std::string> bindings, QWidget* parent);
+  InputBindingDialog(QtHostInterface* host_interface, std::string section_name, std::string key_name,
+                     std::vector<std::string> bindings, QWidget* parent);
   ~InputBindingDialog();
+
+protected Q_SLOTS:
+  void bindToControllerAxis(int controller_index, int axis_index, bool inverted,
+                            std::optional<bool> half_axis_positive);
+  void bindToControllerButton(int controller_index, int button_index);
+  void bindToControllerHat(int controller_index, int hat_index, const QString& hat_direction);
+  void onAddBindingButtonClicked();
+  void onRemoveBindingButtonClicked();
+  void onClearBindingsButtonClicked();
+  void onInputListenTimerTimeout();
 
 protected:
   enum : u32
@@ -37,40 +40,56 @@ protected:
   virtual void stopListeningForInput();
 
   bool isListeningForInput() const { return m_input_listen_timer != nullptr; }
-  void addNewBinding();
+  void addNewBinding(std::string new_binding);
 
   void updateList();
   void saveListToSettings();
 
-  void hookInputManager();
-  void unhookInputManager();
-
-  void onSensitivityChanged(int value);
-  void onResetDeadzoneClicked();
-  void onDeadzoneChanged(int value);
-  void onResetSensitivityClicked();
-
-  void onAddBindingButtonClicked();
-  void onRemoveBindingButtonClicked();
-  void onClearBindingsButtonClicked();
-  void onInputListenTimerTimeout();
-  void inputManagerHookCallback(InputBindingKey key, float value);
-
   Ui::InputBindingDialog m_ui;
 
-  SettingsInterface* m_sif;
-  InputBindingInfo::Type m_bind_type;
+  QtHostInterface* m_host_interface;
+
   std::string m_section_name;
   std::string m_key_name;
   std::vector<std::string> m_bindings;
-  std::vector<InputBindingKey> m_new_bindings;
-  std::vector<std::pair<InputBindingKey, std::pair<float, float>>> m_value_ranges;
+  std::string m_new_binding_value;
 
   QTimer* m_input_listen_timer = nullptr;
   u32 m_input_listen_remaining_seconds = 0;
-  QPoint m_input_listen_start_position{};
-  bool m_mouse_mapping_enabled = false;
-  bool m_sensor_mapping_enabled = false;
+};
 
-  static InputBindingDialog* s_current_hook_dialog;
+class InputButtonBindingDialog final : public InputBindingDialog
+{
+  Q_OBJECT
+
+public:
+  InputButtonBindingDialog(QtHostInterface* host_interface, std::string section_name, std::string key_name,
+                           std::vector<std::string> bindings, QWidget* parent);
+  ~InputButtonBindingDialog();
+
+protected:
+  void startListeningForInput(u32 timeout_in_seconds) override;
+  void stopListeningForInput() override;
+  void hookControllerInput();
+  void unhookControllerInput();
+};
+
+class InputAxisBindingDialog final : public InputBindingDialog
+{
+  Q_OBJECT
+
+public:
+  InputAxisBindingDialog(QtHostInterface* host_interface, std::string section_name, std::string key_name,
+                         std::vector<std::string> bindings, Controller::AxisType axis_type, QWidget* parent);
+  ~InputAxisBindingDialog();
+
+protected:
+  bool eventFilter(QObject* watched, QEvent* event) override;
+  void startListeningForInput(u32 timeout_in_seconds) override;
+  void stopListeningForInput() override;
+  void hookControllerInput();
+  void unhookControllerInput();
+
+private:
+  Controller::AxisType m_axis_type;
 };

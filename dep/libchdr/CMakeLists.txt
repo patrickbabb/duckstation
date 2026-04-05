@@ -1,5 +1,4 @@
 add_library(libchdr
-  include/dr_libs/dr_flac.h
   include/libchdr/bitstream.h
   include/libchdr/cdrom.h
   include/libchdr/chd.h
@@ -15,5 +14,5 @@ add_library(libchdr
 )
 
 target_include_directories(libchdr PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(libchdr PRIVATE ZLIB::ZLIB zstd::libzstd_shared lzma)
+target_link_libraries(libchdr PRIVATE zlib lzma libFLAC)
 

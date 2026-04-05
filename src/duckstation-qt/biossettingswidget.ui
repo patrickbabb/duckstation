@@ -6,11 +6,14 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>732</width>
-    <height>470</height>
+    <width>529</width>
+    <height>330</height>
    </rect>
   </property>
-  <layout class="QVBoxLayout" name="mainLayout">
+  <property name="windowTitle">
+   <string>Form</string>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout_2">
    <property name="leftMargin">
     <number>0</number>
    </property>
@@ -29,6 +32,23 @@
       <string>BIOS Selection</string>
      </property>
      <layout class="QGridLayout" name="gridLayout">
+      <item row="0" column="1">
+       <widget class="QComboBox" name="imageNTSCJ">
+        <property name="sizePolicy">
+         <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+          <horstretch>0</horstretch>
+          <verstretch>0</verstretch>
+         </sizepolicy>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="label_5">
+        <property name="text">
+         <string>PAL (Europe, Australia):</string>
+        </property>
+       </widget>
+      </item>
       <item row="0" column="0">
        <widget class="QLabel" name="label">
         <property name="text">
@@ -36,8 +56,15 @@
         </property>
        </widget>
       </item>
-      <item row="0" column="1">
-       <widget class="QComboBox" name="imageNTSCJ">
+      <item row="1" column="0">
+       <widget class="QLabel" name="label_2">
+        <property name="text">
+         <string>NTSC-U/C (US/Canada):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QComboBox" name="imagePAL">
         <property name="sizePolicy">
          <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
           <horstretch>0</horstretch>
@@ -56,88 +83,32 @@
         </property>
        </widget>
       </item>
-      <item row="1" column="0">
-       <widget class="QLabel" name="label_2">
-        <property name="text">
-         <string>NTSC-U/C (US/Canada):</string>
-        </property>
-       </widget>
-      </item>
-      <item row="2" column="0">
-       <widget class="QLabel" name="label_5">
-        <property name="text">
-         <string>PAL (Europe, Australia):</string>
-        </property>
-       </widget>
-      </item>
-      <item row="2" column="1">
-       <widget class="QComboBox" name="imagePAL">
-        <property name="sizePolicy">
-         <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
-          <horstretch>0</horstretch>
-          <verstretch>0</verstretch>
-         </sizepolicy>
-        </property>
-       </widget>
-      </item>
-     </layout>
-    </widget>
-   </item>
-   <item>
-    <widget class="QGroupBox" name="directoryGroupBox">
-     <property name="title">
-      <string>BIOS Directory</string>
-     </property>
-     <layout class="QGridLayout" name="directoryGroupBoxLayout">
-      <item row="0" column="0" colspan="2">
-       <widget class="QLabel" name="directoryGroupBoxLabel">
-        <property name="text">
-         <string>DuckStation will search for BIOS images in this directory.</string>
-        </property>
-        <property name="wordWrap">
-         <bool>true</bool>
-        </property>
-       </widget>
-      </item>
-      <item row="0" column="2">
-       <widget class="QPushButton" name="rescan">
-        <property name="sizePolicy">
-         <sizepolicy hsizetype="Maximum" vsizetype="Fixed">
-          <horstretch>0</horstretch>
-          <verstretch>0</verstretch>
-         </sizepolicy>
-        </property>
-        <property name="toolTip">
-         <string>Refresh BIOS List</string>
-        </property>
-        <property name="icon">
-         <iconset theme="refresh-line"/>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="0" colspan="3">
-       <layout class="QHBoxLayout" name="directoryGroupBoxHorizontalLayout">
+      <item row="3" column="1">
+       <layout class="QHBoxLayout" name="horizontalLayout_2">
         <item>
-         <widget class="QLineEdit" name="searchDirectory"/>
+         <spacer name="horizontalSpacer">
+          <property name="orientation">
+           <enum>Qt::Horizontal</enum>
+          </property>
+          <property name="sizeHint" stdset="0">
+           <size>
+            <width>40</width>
+            <height>20</height>
+           </size>
+          </property>
+         </spacer>
         </item>
         <item>
-         <widget class="QPushButton" name="browseSearchDirectory">
+         <widget class="QPushButton" name="openSearchDirectory">
           <property name="text">
-           <string>Browse...</string>
+           <string>Open in Explorer...</string>
           </property>
          </widget>
         </item>
         <item>
-         <widget class="QPushButton" name="searchDirectoryOpen">
+         <widget class="QPushButton" name="refresh">
           <property name="text">
-           <string>Open...</string>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QPushButton" name="searchDirectoryReset">
-          <property name="text">
-           <string>Reset</string>
+           <string>Refresh List</string>
           </property>
          </widget>
         </item>
@@ -147,58 +118,30 @@
     </widget>
    </item>
    <item>
-    <widget class="QGroupBox" name="pioGroupBox">
+    <widget class="QGroupBox" name="groupBox_3">
      <property name="title">
-      <string>Parallel Port</string>
+      <string>BIOS Directory</string>
      </property>
-     <layout class="QGridLayout" name="gridLayout_4">
-      <item row="0" column="0">
+     <layout class="QGridLayout" name="gridLayout_2">
+      <item row="0" column="0" colspan="2">
        <widget class="QLabel" name="label_3">
         <property name="text">
-         <string>Device Type:</string>
+         <string>DuckStation will search for BIOS images in this directory.</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
         </property>
        </widget>
       </item>
-      <item row="0" column="1" colspan="2">
-       <widget class="QComboBox" name="pioDeviceType">
-        <property name="sizePolicy">
-         <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
-          <horstretch>0</horstretch>
-          <verstretch>0</verstretch>
-         </sizepolicy>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="0">
-       <widget class="QLabel" name="pioImagePathLabel">
-        <property name="text">
-         <string>Image Path:</string>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="1">
-       <widget class="QLineEdit" name="pioImagePath"/>
-      </item>
-      <item row="1" column="2">
-       <widget class="QPushButton" name="pioImagePathBrowse">
-        <property name="text">
-         <string>Browse...</string>
-        </property>
-       </widget>
-      </item>
-      <item row="2" column="0" colspan="3">
-       <layout class="QGridLayout" name="gridLayout_3">
-        <item row="0" column="0">
-         <widget class="QCheckBox" name="pioSwitchActive">
-          <property name="text">
-           <string>Cartridge Switch On</string>
-          </property>
-         </widget>
+      <item row="1" column="0" colspan="2">
+       <layout class="QHBoxLayout" name="horizontalLayout">
+        <item>
+         <widget class="QLineEdit" name="searchDirectory"/>
         </item>
-        <item row="0" column="1">
-         <widget class="QCheckBox" name="pioImageWrites">
+        <item>
+         <widget class="QPushButton" name="browseSearchDirectory">
           <property name="text">
-           <string>Allow Image Writes</string>
+           <string>Browse...</string>
           </property>
          </widget>
         </item>
@@ -210,13 +153,20 @@
    <item>
     <widget class="QGroupBox" name="groupBox_2">
      <property name="title">
-      <string>Options</string>
+      <string>Options and Patches</string>
      </property>
-     <layout class="QGridLayout" name="gridLayout_2">
-      <item row="0" column="0">
-       <widget class="QCheckBox" name="enableTTYLogging">
+     <layout class="QVBoxLayout" name="verticalLayout">
+      <item>
+       <widget class="QCheckBox" name="fastBoot">
         <property name="text">
-         <string>Enable TTY Logging</string>
+         <string>Fast Boot</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="enableTTYOutput">
+        <property name="text">
+         <string>Enable TTY Output</string>
         </property>
        </widget>
       </item>
@@ -226,12 +176,12 @@
    <item>
     <spacer name="verticalSpacer">
      <property name="orientation">
-      <enum>Qt::Orientation::Vertical</enum>
+      <enum>Qt::Vertical</enum>
      </property>
      <property name="sizeHint" stdset="0">
       <size>
-       <width>0</width>
-       <height>0</height>
+       <width>20</width>
+       <height>40</height>
       </size>
      </property>
     </spacer>

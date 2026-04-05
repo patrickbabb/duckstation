@@ -15,6 +15,5 @@
     <ClInclude Include="include\libchdr\huffman.h" />
     <ClInclude Include="include\libchdr\bitstream.h" />
     <ClInclude Include="include\libchdr\cdrom.h" />
-    <ClInclude Include="include\dr_libs\dr_flac.h" />
   </ItemGroup>
 </Project>

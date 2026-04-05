@@ -68,19 +68,14 @@ class CodeBufferCheckScope {
                        size_t size,
                        BufferSpacePolicy check_policy = kReserveBufferSpace,
                        SizePolicy size_policy = kMaximumSize)
-      : CodeBufferCheckScope() {
+      : assembler_(NULL), initialised_(false) {
     Open(assembler, size, check_policy, size_policy);
   }
 
   // This constructor does not implicitly initialise the scope. Instead, the
   // user is required to explicitly call the `Open` function before using the
   // scope.
-  CodeBufferCheckScope()
-      : assembler_(NULL),
-        assert_policy_(kMaximumSize),
-        limit_(0),
-        previous_allow_assembler_(false),
-        initialised_(false) {
+  CodeBufferCheckScope() : assembler_(NULL), initialised_(false) {
     // Nothing to do.
   }
 
@@ -95,7 +90,7 @@ class CodeBufferCheckScope {
     VIXL_ASSERT(assembler != NULL);
     assembler_ = assembler;
     if (check_policy == kReserveBufferSpace) {
-      VIXL_ASSERT(assembler->GetBuffer()->HasSpaceFor(size));
+      assembler->GetBuffer()->EnsureSpaceFor(size);
     }
 #ifdef VIXL_DEBUG
     limit_ = assembler_->GetSizeOfCodeGenerated() + size;
@@ -157,15 +152,14 @@ class EmissionCheckScope : public CodeBufferCheckScope {
   // constructed.
   EmissionCheckScope(MacroAssemblerInterface* masm,
                      size_t size,
-                     SizePolicy size_policy = kMaximumSize)
-      : EmissionCheckScope() {
+                     SizePolicy size_policy = kMaximumSize) {
     Open(masm, size, size_policy);
   }
 
   // This constructor does not implicitly initialise the scope. Instead, the
   // user is required to explicitly call the `Open` function before using the
   // scope.
-  EmissionCheckScope() : masm_(nullptr), pool_policy_(kBlockPools) {}
+  EmissionCheckScope() {}
 
   virtual ~EmissionCheckScope() { Close(); }
 
@@ -256,15 +250,14 @@ class ExactAssemblyScope : public EmissionCheckScope {
   // constructed.
   ExactAssemblyScope(MacroAssemblerInterface* masm,
                      size_t size,
-                     SizePolicy size_policy = kExactSize)
-      : ExactAssemblyScope() {
+                     SizePolicy size_policy = kExactSize) {
     Open(masm, size, size_policy);
   }
 
   // This constructor does not implicitly initialise the scope. Instead, the
   // user is required to explicitly call the `Open` function before using the
   // scope.
-  ExactAssemblyScope() : previous_allow_macro_assembler_(false) {}
+  ExactAssemblyScope() {}
 
   virtual ~ExactAssemblyScope() { Close(); }
 

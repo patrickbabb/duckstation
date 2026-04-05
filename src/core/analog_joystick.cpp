@@ -1,27 +1,15 @@
-// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com> and contributors.
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #include "analog_joystick.h"
-#include "system.h"
-
-#include "util/imgui_manager.h"
-#include "util/input_manager.h"
-#include "util/state_wrapper.h"
-#include "util/translation.h"
-
-#include "common/bitutils.h"
 #include "common/log.h"
-#include "common/settings_interface.h"
+#include "common/state_wrapper.h"
 #include "common/string_util.h"
+#include "host_interface.h"
+#include "system.h"
+#include <cmath>
+Log_SetChannel(AnalogJoystick);
 
-#include "IconsFontAwesome.h"
-#include "IconsPromptFont.h"
-#include "fmt/format.h"
-
-LOG_CHANNEL(Controller);
-
-AnalogJoystick::AnalogJoystick(u32 index) : Controller(index)
+AnalogJoystick::AnalogJoystick(u32 index)
 {
+  m_index = index;
   m_axis_state.fill(0x80);
   Reset();
 }
@@ -36,8 +24,6 @@ ControllerType AnalogJoystick::GetType() const
 void AnalogJoystick::Reset()
 {
   m_transfer_state = TransferState::Idle;
-  m_analog_mode = true;
-  InputManager::SetPadLEDState(m_index, 1.0f);
 }
 
 bool AnalogJoystick::DoState(StateWrapper& sw, bool apply_input_state)
@@ -64,146 +50,98 @@ bool AnalogJoystick::DoState(StateWrapper& sw, bool apply_input_state)
 
   if (sw.IsReading() && (old_analog_mode != m_analog_mode))
   {
-    Host::AddIconOSDMessage(
-      OSDMessageType::Quick, fmt::format("analog_mode_toggle_{}", m_index), ICON_FA_GAMEPAD,
-      m_analog_mode ? fmt::format(TRANSLATE_FS("Controller", "Controller {} switched to analog mode."), m_index + 1u) :
-                      fmt::format(TRANSLATE_FS("Controller", "Controller {} switched to digital mode."), m_index + 1u));
+    g_host_interface->AddFormattedOSDMessage(
+      5.0f,
+      m_analog_mode ? g_host_interface->TranslateString("AnalogJoystick", "Controller %u switched to analog mode.") :
+                      g_host_interface->TranslateString("AnalogJoystick", "Controller %u switched to digital mode."),
+      m_index + 1u);
   }
   return true;
 }
 
-float AnalogJoystick::GetBindState(u32 index) const
+std::optional<s32> AnalogJoystick::GetAxisCodeByName(std::string_view axis_name) const
 {
-  if (index >= LED_BIND_START_INDEX)
-    return BoolToFloat(index == LED_BIND_START_INDEX && m_analog_mode);
-  else if (index >= HALFAXIS_BIND_START_INDEX)
-    return static_cast<float>(m_half_axis_state[index - HALFAXIS_BIND_START_INDEX]) * (1.0f / 255.0f);
-  else if (index < static_cast<u32>(Button::Mode))
-    return static_cast<float>(((m_button_state >> index) & 1u) ^ 1u);
-  else
-    return 0.0f;
+  return StaticGetAxisCodeByName(axis_name);
 }
 
-void AnalogJoystick::SetBindState(u32 index, float value)
+std::optional<s32> AnalogJoystick::GetButtonCodeByName(std::string_view button_name) const
 {
-  if (index == static_cast<s32>(Button::Mode))
+  return StaticGetButtonCodeByName(button_name);
+}
+
+float AnalogJoystick::GetAxisState(s32 axis_code) const
+{
+  if (axis_code < 0 || axis_code >= static_cast<s32>(Axis::Count))
+    return 0.0f;
+
+  // 0..255 -> -1..1
+  const float value = (((static_cast<float>(m_axis_state[static_cast<s32>(axis_code)]) / 255.0f) * 2.0f) - 1.0f);
+  return std::clamp(value / m_axis_scale, -1.0f, 1.0f);
+}
+
+void AnalogJoystick::SetAxisState(s32 axis_code, float value)
+{
+  if (axis_code < 0 || axis_code >= static_cast<s32>(Axis::Count))
+    return;
+
+  // -1..1 -> 0..255
+  const float scaled_value = std::clamp(value * m_axis_scale, -1.0f, 1.0f);
+  const u8 u8_value = static_cast<u8>(std::clamp(((scaled_value + 1.0f) / 2.0f) * 255.0f, 0.0f, 255.0f));
+
+  SetAxisState(static_cast<Axis>(axis_code), u8_value);
+}
+
+void AnalogJoystick::SetAxisState(Axis axis, u8 value)
+{
+  if (m_axis_state[static_cast<u8>(axis)] != value)
+    System::SetRunaheadReplayFlag();
+
+  m_axis_state[static_cast<u8>(axis)] = value;
+}
+
+bool AnalogJoystick::GetButtonState(s32 button_code) const
+{
+  if (button_code < 0 || button_code >= static_cast<s32>(Button::Count))
+    return false;
+
+  const u16 bit = u16(1) << static_cast<u8>(button_code);
+  return ((m_button_state & bit) == 0);
+}
+
+void AnalogJoystick::SetButtonState(Button button, bool pressed)
+{
+  if (button == Button::Mode)
   {
-    // analog toggle
-    if (value >= 0.5f)
+    if (pressed)
       ToggleAnalogMode();
 
     return;
   }
-  else if (index >= static_cast<u32>(Button::Count))
-  {
-    const u32 sub_index = index - static_cast<u32>(Button::Count);
-    if (sub_index >= static_cast<u32>(m_half_axis_state.size()))
-      return;
 
-    const u8 u8_value = static_cast<u8>(std::clamp(value * m_analog_sensitivity * 255.0f, 0.0f, 255.0f));
-    if (m_half_axis_state[sub_index] == u8_value)
-      return;
+  const u16 bit = u16(1) << static_cast<u8>(button);
 
-    m_half_axis_state[sub_index] = u8_value;
-
-#define MERGE(pos, neg)                                                                                                \
-  ((m_half_axis_state[static_cast<u32>(pos)] != 0) ? (127u + ((m_half_axis_state[static_cast<u32>(pos)] + 1u) / 2u)) : \
-                                                     (127u - (m_half_axis_state[static_cast<u32>(neg)] / 2u)))
-
-    const auto prev_axis_state = m_axis_state;
-
-    switch (static_cast<HalfAxis>(sub_index))
-    {
-      case HalfAxis::LLeft:
-      case HalfAxis::LRight:
-        m_axis_state[static_cast<u8>(Axis::LeftX)] = ((m_invert_left_stick & 1u) != 0u) ?
-                                                       MERGE(HalfAxis::LLeft, HalfAxis::LRight) :
-                                                       MERGE(HalfAxis::LRight, HalfAxis::LLeft);
-        break;
-
-      case HalfAxis::LDown:
-      case HalfAxis::LUp:
-        m_axis_state[static_cast<u8>(Axis::LeftY)] = ((m_invert_left_stick & 2u) != 0u) ?
-                                                       MERGE(HalfAxis::LUp, HalfAxis::LDown) :
-                                                       MERGE(HalfAxis::LDown, HalfAxis::LUp);
-        break;
-
-      case HalfAxis::RLeft:
-      case HalfAxis::RRight:
-        m_axis_state[static_cast<u8>(Axis::RightX)] = ((m_invert_right_stick & 1u) != 0u) ?
-                                                        MERGE(HalfAxis::RLeft, HalfAxis::RRight) :
-                                                        MERGE(HalfAxis::RRight, HalfAxis::RLeft);
-        break;
-
-      case HalfAxis::RDown:
-      case HalfAxis::RUp:
-        m_axis_state[static_cast<u8>(Axis::RightY)] = ((m_invert_right_stick & 2u) != 0u) ?
-                                                        MERGE(HalfAxis::RUp, HalfAxis::RDown) :
-                                                        MERGE(HalfAxis::RDown, HalfAxis::RUp);
-        break;
-
-      default:
-        break;
-    }
-
-    if (m_analog_deadzone > 0.0f)
-    {
-#define MERGE_F(pos, neg)                                                                                              \
-  ((m_half_axis_state[static_cast<u32>(pos)] != 0) ?                                                                   \
-     (static_cast<float>(m_half_axis_state[static_cast<u32>(pos)]) / 255.0f) :                                         \
-     (static_cast<float>(m_half_axis_state[static_cast<u32>(neg)]) / -255.0f))
-
-      float pos_x, pos_y;
-      if (static_cast<HalfAxis>(sub_index) < HalfAxis::RLeft)
-      {
-        pos_x = ((m_invert_left_stick & 1u) != 0u) ? MERGE_F(HalfAxis::LLeft, HalfAxis::LRight) :
-                                                     MERGE_F(HalfAxis::LRight, HalfAxis::LLeft);
-        pos_y = ((m_invert_left_stick & 2u) != 0u) ? MERGE_F(HalfAxis::LUp, HalfAxis::LDown) :
-                                                     MERGE_F(HalfAxis::LDown, HalfAxis::LUp);
-      }
-      else
-      {
-        pos_x = ((m_invert_right_stick & 1u) != 0u) ? MERGE_F(HalfAxis::RLeft, HalfAxis::RRight) :
-                                                      MERGE_F(HalfAxis::RRight, HalfAxis::RLeft);
-        pos_y = ((m_invert_right_stick & 2u) != 0u) ? MERGE_F(HalfAxis::RUp, HalfAxis::RDown) :
-                                                      MERGE_F(HalfAxis::RDown, HalfAxis::RUp);
-      }
-
-      if (InCircularDeadzone(m_analog_deadzone, pos_x, pos_y))
-      {
-        // Set to 127 (center).
-        if (static_cast<HalfAxis>(sub_index) < HalfAxis::RLeft)
-          m_axis_state[static_cast<u8>(Axis::LeftX)] = m_axis_state[static_cast<u8>(Axis::LeftY)] = 127;
-        else
-          m_axis_state[static_cast<u8>(Axis::RightX)] = m_axis_state[static_cast<u8>(Axis::RightY)] = 127;
-      }
-#undef MERGE_F
-    }
-
-    if (std::memcmp(m_axis_state.data(), prev_axis_state.data(), m_axis_state.size()) != 0)
-      System::SetRunaheadReplayFlag(true);
-
-#undef MERGE
-
-    return;
-  }
-
-  const u16 bit = u16(1) << static_cast<u8>(index);
-
-  if (value >= 0.5f)
+  if (pressed)
   {
     if (m_button_state & bit)
-      System::SetRunaheadReplayFlag(false);
+      System::SetRunaheadReplayFlag();
 
-    m_button_state &= ~(bit);
+    m_button_state &= ~bit;
   }
   else
   {
     if (!(m_button_state & bit))
-      System::SetRunaheadReplayFlag(false);
+      System::SetRunaheadReplayFlag();
 
     m_button_state |= bit;
   }
+}
+
+void AnalogJoystick::SetButtonState(s32 button_code, bool pressed)
+{
+  if (button_code < 0 || button_code >= static_cast<s32>(Button::Count))
+    return;
+
+  SetButtonState(static_cast<Button>(button_code), pressed);
 }
 
 u32 AnalogJoystick::GetButtonStateBits() const
@@ -234,13 +172,12 @@ void AnalogJoystick::ToggleAnalogMode()
 {
   m_analog_mode = !m_analog_mode;
 
-  InputManager::SetPadLEDState(m_index, BoolToFloat(m_analog_mode));
-
-  INFO_LOG("Joystick {} switched to {} mode.", m_index + 1u, m_analog_mode ? "analog" : "digital");
-  Host::AddIconOSDMessage(
-    OSDMessageType::Quick, fmt::format("analog_mode_toggle_{}", m_index), ICON_FA_GAMEPAD,
-    m_analog_mode ? fmt::format(TRANSLATE_FS("Controller", "Controller {} switched to analog mode."), m_index + 1u) :
-                    fmt::format(TRANSLATE_FS("Controller", "Controller {} switched to digital mode."), m_index + 1u));
+  Log_InfoPrintf("Joystick %u switched to %s mode.", m_index + 1u, m_analog_mode ? "analog" : "digital");
+  g_host_interface->AddFormattedOSDMessage(
+    5.0f,
+    m_analog_mode ? g_host_interface->TranslateString("AnalogJoystick", "Controller %u switched to analog mode.") :
+                    g_host_interface->TranslateString("AnalogJoystick", "Controller %u switched to digital mode."),
+    m_index + 1u);
 }
 
 bool AnalogJoystick::Transfer(const u8 data_in, u8* data_out)
@@ -335,89 +272,104 @@ std::unique_ptr<AnalogJoystick> AnalogJoystick::Create(u32 index)
   return std::make_unique<AnalogJoystick>(index);
 }
 
-constinit const Controller::ControllerBindingInfo AnalogJoystick::s_binding_info[] = {
-#define BUTTON(name, display_name, icon_name, button, genb)                                                            \
-  {name, display_name, icon_name, static_cast<u32>(button), InputBindingInfo::Type::Button, genb}
-#define AXIS(name, display_name, icon_name, halfaxis, genb)                                                            \
-  {name,                                                                                                               \
-   display_name,                                                                                                       \
-   icon_name,                                                                                                          \
-   HALFAXIS_BIND_START_INDEX + static_cast<u32>(halfaxis),                                                             \
-   InputBindingInfo::Type::HalfAxis,                                                                                   \
-   genb}
-#define MODE_LED(name, display_name, icon_name, index, genb)                                                           \
-  {name, display_name, icon_name, LED_BIND_START_INDEX + index, InputBindingInfo::Type::LED, genb}
+std::optional<s32> AnalogJoystick::StaticGetAxisCodeByName(std::string_view axis_name)
+{
+#define AXIS(name)                                                                                                     \
+  if (axis_name == #name)                                                                                              \
+  {                                                                                                                    \
+    return static_cast<s32>(ZeroExtend32(static_cast<u8>(Axis::name)));                                                \
+  }
 
-  // clang-format off
-  BUTTON("Up", TRANSLATE_NOOP("AnalogJoystick", "D-Pad Up"), ICON_PF_DPAD_UP, AnalogJoystick::Button::Up, GenericInputBinding::DPadUp),
-  BUTTON("Right", TRANSLATE_NOOP("AnalogJoystick", "D-Pad Right"), ICON_PF_DPAD_RIGHT, AnalogJoystick::Button::Right, GenericInputBinding::DPadRight),
-  BUTTON("Down", TRANSLATE_NOOP("AnalogJoystick", "D-Pad Down"), ICON_PF_DPAD_DOWN, AnalogJoystick::Button::Down, GenericInputBinding::DPadDown),
-  BUTTON("Left", TRANSLATE_NOOP("AnalogJoystick", "D-Pad Left"), ICON_PF_DPAD_LEFT, AnalogJoystick::Button::Left, GenericInputBinding::DPadLeft),
-  BUTTON("Triangle", TRANSLATE_NOOP("AnalogJoystick", "Triangle"), ICON_PF_BUTTON_TRIANGLE, AnalogJoystick::Button::Triangle, GenericInputBinding::Triangle),
-  BUTTON("Circle", TRANSLATE_NOOP("AnalogJoystick", "Circle"), ICON_PF_BUTTON_CIRCLE, AnalogJoystick::Button::Circle, GenericInputBinding::Circle),
-  BUTTON("Cross", TRANSLATE_NOOP("AnalogJoystick", "Cross"), ICON_PF_BUTTON_CROSS, AnalogJoystick::Button::Cross, GenericInputBinding::Cross),
-  BUTTON("Square", TRANSLATE_NOOP("AnalogJoystick", "Square"), ICON_PF_BUTTON_SQUARE, AnalogJoystick::Button::Square, GenericInputBinding::Square),
-  BUTTON("Select", TRANSLATE_NOOP("AnalogJoystick", "Select"), ICON_PF_SELECT_SHARE, AnalogJoystick::Button::Select, GenericInputBinding::Select),
-  BUTTON("Start", TRANSLATE_NOOP("AnalogJoystick", "Start"), ICON_PF_START, AnalogJoystick::Button::Start, GenericInputBinding::Start),
-  BUTTON("Mode", TRANSLATE_NOOP("AnalogJoystick", "Mode Toggle"), ICON_PF_ANALOG_LEFT_RIGHT, AnalogJoystick::Button::Mode, GenericInputBinding::System),
-  BUTTON("L1", TRANSLATE_NOOP("AnalogJoystick", "L1"), ICON_PF_LEFT_SHOULDER_L1, AnalogJoystick::Button::L1, GenericInputBinding::L1),
-  BUTTON("R1", TRANSLATE_NOOP("AnalogJoystick", "R1"), ICON_PF_RIGHT_SHOULDER_R1, AnalogJoystick::Button::R1, GenericInputBinding::R1),
-  BUTTON("L2", TRANSLATE_NOOP("AnalogJoystick", "L2"), ICON_PF_LEFT_TRIGGER_L2, AnalogJoystick::Button::L2, GenericInputBinding::L2),
-  BUTTON("R2", TRANSLATE_NOOP("AnalogJoystick", "R2"), ICON_PF_RIGHT_TRIGGER_R2, AnalogJoystick::Button::R2, GenericInputBinding::R2),
-  BUTTON("L3", TRANSLATE_NOOP("AnalogJoystick", "L3"), ICON_PF_LEFT_ANALOG_CLICK, AnalogJoystick::Button::L3, GenericInputBinding::L3),
-  BUTTON("R3", TRANSLATE_NOOP("AnalogJoystick", "R3"), ICON_PF_RIGHT_ANALOG_CLICK, AnalogJoystick::Button::R3, GenericInputBinding::R3),
+  AXIS(LeftX);
+  AXIS(LeftY);
+  AXIS(RightX);
+  AXIS(RightY);
 
-  AXIS("LLeft", TRANSLATE_NOOP("AnalogJoystick", "Left Stick Left"), ICON_PF_LEFT_ANALOG_LEFT, AnalogJoystick::HalfAxis::LLeft, GenericInputBinding::LeftStickLeft),
-  AXIS("LRight", TRANSLATE_NOOP("AnalogJoystick", "Left Stick Right"), ICON_PF_LEFT_ANALOG_RIGHT, AnalogJoystick::HalfAxis::LRight, GenericInputBinding::LeftStickRight),
-  AXIS("LDown", TRANSLATE_NOOP("AnalogJoystick", "Left Stick Down"), ICON_PF_LEFT_ANALOG_DOWN, AnalogJoystick::HalfAxis::LDown, GenericInputBinding::LeftStickDown),
-  AXIS("LUp", TRANSLATE_NOOP("AnalogJoystick", "Left Stick Up"), ICON_PF_LEFT_ANALOG_UP, AnalogJoystick::HalfAxis::LUp, GenericInputBinding::LeftStickUp),
-  AXIS("RLeft", TRANSLATE_NOOP("AnalogJoystick", "Right Stick Left"), ICON_PF_RIGHT_ANALOG_LEFT, AnalogJoystick::HalfAxis::RLeft, GenericInputBinding::RightStickLeft),
-  AXIS("RRight", TRANSLATE_NOOP("AnalogJoystick", "Right Stick Right"), ICON_PF_RIGHT_ANALOG_RIGHT, AnalogJoystick::HalfAxis::RRight, GenericInputBinding::RightStickRight),
-  AXIS("RDown", TRANSLATE_NOOP("AnalogJoystick", "Right Stick Down"), ICON_PF_RIGHT_ANALOG_DOWN, AnalogJoystick::HalfAxis::RDown, GenericInputBinding::RightStickDown),
-  AXIS("RUp", TRANSLATE_NOOP("AnalogJoystick", "Right Stick Up"), ICON_PF_RIGHT_ANALOG_UP, AnalogJoystick::HalfAxis::RUp, GenericInputBinding::RightStickUp),
-
-  MODE_LED("ModeLED", TRANSLATE_NOOP("AnalogJoystick", "Mode LED"), ICON_PF_LED, 0, GenericInputBinding::ModeLED),
-// clang-format on
+  return std::nullopt;
 
 #undef AXIS
-#undef BUTTON
-#undef MODE_LED
-};
+}
 
-static constexpr const char* s_invert_settings[] = {
-  TRANSLATE_NOOP("AnalogJoystick", "Not Inverted"), TRANSLATE_NOOP("AnalogJoystick", "Invert Left/Right"),
-  TRANSLATE_NOOP("AnalogJoystick", "Invert Up/Down"), TRANSLATE_NOOP("AnalogJoystick", "Invert Left/Right + Up/Down"),
-  nullptr};
-
-static const SettingInfo s_settings[] = {
-  {SettingInfo::Type::Float, "AnalogDeadzone", TRANSLATE_NOOP("AnalogJoystick", "Analog Deadzone"),
-   TRANSLATE_NOOP("AnalogJoystick",
-                  "Sets the analog stick deadzone, i.e. the fraction of the stick movement which will be ignored."),
-   "0", "0", "1", "0.01", "%.0f%%", nullptr, 100.0f},
-  {SettingInfo::Type::Float, "AnalogSensitivity", TRANSLATE_NOOP("AnalogJoystick", "Analog Sensitivity"),
-   TRANSLATE_NOOP(
-     "AnalogJoystick",
-     "Sets the analog stick axis scaling factor. A value between 130% and 140% is recommended when using recent "
-     "controllers, e.g. DualShock 4, Xbox One Controller."),
-   "1.33", "0.01", "2", "0.01", "%.0f%%", nullptr, 100.0f},
-  {SettingInfo::Type::IntegerList, "InvertLeftStick", TRANSLATE_NOOP("AnalogJoystick", "Invert Left Stick"),
-   TRANSLATE_NOOP("AnalogJoystick", "Inverts the direction of the left analog stick."), "0", "0", "3", nullptr, nullptr,
-   s_invert_settings, 0.0f},
-  {SettingInfo::Type::IntegerList, "InvertRightStick", TRANSLATE_NOOP("AnalogJoystick", "Invert Right Stick"),
-   TRANSLATE_NOOP("AnalogJoystick", "Inverts the direction of the right analog stick."), "0", "0", "3", nullptr,
-   nullptr, s_invert_settings, 0.0f},
-};
-
-const Controller::ControllerInfo AnalogJoystick::INFO = {
-  ControllerType::AnalogJoystick, "AnalogJoystick", TRANSLATE_NOOP("ControllerType", "Analog Joystick"),
-  ICON_PF_FLIGHT_STICK,           s_binding_info,   s_settings};
-
-void AnalogJoystick::LoadSettings(const SettingsInterface& si, const char* section, bool initial)
+std::optional<s32> AnalogJoystick::StaticGetButtonCodeByName(std::string_view button_name)
 {
-  Controller::LoadSettings(si, section, initial);
-  m_analog_deadzone = std::clamp(si.GetFloatValue(section, "AnalogDeadzone", DEFAULT_STICK_DEADZONE), 0.0f, 1.0f);
-  m_analog_sensitivity =
-    std::clamp(si.GetFloatValue(section, "AnalogSensitivity", DEFAULT_STICK_SENSITIVITY), 0.01f, 3.0f);
-  m_invert_left_stick = static_cast<u8>(si.GetIntValue(section, "InvertLeftStick", 0));
-  m_invert_right_stick = static_cast<u8>(si.GetIntValue(section, "InvertRightStick", 0));
+#define BUTTON(name)                                                                                                   \
+  if (button_name == #name)                                                                                            \
+  {                                                                                                                    \
+    return static_cast<s32>(ZeroExtend32(static_cast<u8>(Button::name)));                                              \
+  }
+
+  BUTTON(Select);
+  BUTTON(L3);
+  BUTTON(R3);
+  BUTTON(Start);
+  BUTTON(Up);
+  BUTTON(Right);
+  BUTTON(Down);
+  BUTTON(Left);
+  BUTTON(L2);
+  BUTTON(R2);
+  BUTTON(L1);
+  BUTTON(R1);
+  BUTTON(Triangle);
+  BUTTON(Circle);
+  BUTTON(Cross);
+  BUTTON(Square);
+  BUTTON(Mode);
+
+  return std::nullopt;
+
+#undef BUTTON
+}
+
+Controller::AxisList AnalogJoystick::StaticGetAxisNames()
+{
+  return {{TRANSLATABLE("AnalogJoystick", "LeftX"), static_cast<s32>(Axis::LeftX), AxisType::Full},
+          {TRANSLATABLE("AnalogJoystick", "LeftY"), static_cast<s32>(Axis::LeftY), AxisType::Full},
+          {TRANSLATABLE("AnalogJoystick", "RightX"), static_cast<s32>(Axis::RightX), AxisType::Full},
+          {TRANSLATABLE("AnalogJoystick", "RightY"), static_cast<s32>(Axis::RightY), AxisType::Full}};
+}
+
+Controller::ButtonList AnalogJoystick::StaticGetButtonNames()
+{
+  return {{TRANSLATABLE("AnalogJoystick", "Up"), static_cast<s32>(Button::Up)},
+          {TRANSLATABLE("AnalogJoystick", "Down"), static_cast<s32>(Button::Down)},
+          {TRANSLATABLE("AnalogJoystick", "Left"), static_cast<s32>(Button::Left)},
+          {TRANSLATABLE("AnalogJoystick", "Right"), static_cast<s32>(Button::Right)},
+          {TRANSLATABLE("AnalogJoystick", "Select"), static_cast<s32>(Button::Select)},
+          {TRANSLATABLE("AnalogJoystick", "Start"), static_cast<s32>(Button::Start)},
+          {TRANSLATABLE("AnalogJoystick", "Triangle"), static_cast<s32>(Button::Triangle)},
+          {TRANSLATABLE("AnalogJoystick", "Cross"), static_cast<s32>(Button::Cross)},
+          {TRANSLATABLE("AnalogJoystick", "Circle"), static_cast<s32>(Button::Circle)},
+          {TRANSLATABLE("AnalogJoystick", "Square"), static_cast<s32>(Button::Square)},
+          {TRANSLATABLE("AnalogJoystick", "L1"), static_cast<s32>(Button::L1)},
+          {TRANSLATABLE("AnalogJoystick", "L2"), static_cast<s32>(Button::L2)},
+          {TRANSLATABLE("AnalogJoystick", "R1"), static_cast<s32>(Button::R1)},
+          {TRANSLATABLE("AnalogJoystick", "R2"), static_cast<s32>(Button::R2)},
+          {TRANSLATABLE("AnalogJoystick", "L3"), static_cast<s32>(Button::L3)},
+          {TRANSLATABLE("AnalogJoystick", "R3"), static_cast<s32>(Button::R3)},
+          {TRANSLATABLE("AnalogJoystick", "Analog"), static_cast<s32>(Button::Mode)}};
+}
+
+u32 AnalogJoystick::StaticGetVibrationMotorCount()
+{
+  return 0;
+}
+
+Controller::SettingList AnalogJoystick::StaticGetSettings()
+{
+  static constexpr std::array<SettingInfo, 1> settings = {
+    {{SettingInfo::Type::Float, "AxisScale", TRANSLATABLE("AnalogJoystick", "Analog Axis Scale"),
+      TRANSLATABLE(
+        "AnalogJoystick",
+        "Sets the analog stick axis scaling factor. A value between 1.30 and 1.40 is recommended when using recent "
+        "controllers, e.g. DualShock 4, Xbox One Controller."),
+      "1.00f", "0.01f", "1.50f", "0.01f"}}};
+
+  return SettingList(settings.begin(), settings.end());
+}
+
+void AnalogJoystick::LoadSettings(const char* section)
+{
+  Controller::LoadSettings(section);
+  m_axis_scale = std::clamp(g_host_interface->GetFloatSettingValue(section, "AxisScale", 1.00f), 0.01f, 1.50f);
 }

@@ -1,13 +1,9 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com> and contributors.
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #pragma once
-
 #include "controller.h"
-
 #include <array>
 #include <memory>
 #include <optional>
+#include <string_view>
 
 class AnalogController final : public Controller
 {
@@ -43,42 +39,43 @@ public:
     Count
   };
 
-  enum class HalfAxis : u8
-  {
-    LLeft,
-    LRight,
-    LDown,
-    LUp,
-    RLeft,
-    RRight,
-    RDown,
-    RUp,
-    Count
-  };
-
   static constexpr u8 NUM_MOTORS = 2;
 
-  static const Controller::ControllerInfo INFO;
-
-  explicit AnalogController(u32 index);
+  AnalogController(u32 index);
   ~AnalogController() override;
 
   static std::unique_ptr<AnalogController> Create(u32 index);
+  static std::optional<s32> StaticGetAxisCodeByName(std::string_view axis_name);
+  static std::optional<s32> StaticGetButtonCodeByName(std::string_view button_name);
+  static AxisList StaticGetAxisNames();
+  static ButtonList StaticGetButtonNames();
+  static u32 StaticGetVibrationMotorCount();
+  static SettingList StaticGetSettings();
 
   ControllerType GetType() const override;
+  std::optional<s32> GetAxisCodeByName(std::string_view axis_name) const override;
+  std::optional<s32> GetButtonCodeByName(std::string_view button_name) const override;
 
   void Reset() override;
   bool DoState(StateWrapper& sw, bool ignore_input_state) override;
 
-  float GetBindState(u32 index) const override;
-  void SetBindState(u32 index, float value) override;
+  float GetAxisState(s32 axis_code) const override;
+  void SetAxisState(s32 axis_code, float value) override;
+  bool GetButtonState(s32 button_code) const override;
+  void SetButtonState(s32 button_code, bool pressed) override;
   u32 GetButtonStateBits() const override;
   std::optional<u32> GetAnalogInputBytes() const override;
 
   void ResetTransferState() override;
   bool Transfer(const u8 data_in, u8* data_out) override;
 
-  void LoadSettings(const SettingsInterface& si, const char* section, bool initial) override;
+  void SetAxisState(Axis axis, u8 value);
+  void SetButtonState(Button button, bool pressed);
+
+  u32 GetVibrationMotorCount() const override;
+  float GetVibrationMotorStrength(u32 motor) override;
+
+  void LoadSettings(const char* section) override;
 
 private:
   using MotorState = std::array<u8, NUM_MOTORS>;
@@ -97,23 +94,14 @@ private:
     GetSetRumble       // 0x4D
   };
 
-  static constexpr s16 DEFAULT_SMALL_MOTOR_VIBRATION_BIAS = 8;
-  static constexpr s16 DEFAULT_LARGE_MOTOR_VIBRATION_BIAS = 8;
-
-  static constexpr u32 HALFAXIS_BIND_START_INDEX = static_cast<u32>(Button::Count);
-  static constexpr u32 MOTOR_BIND_START_INDEX = HALFAXIS_BIND_START_INDEX + static_cast<u32>(HalfAxis::Count);
-  static constexpr u32 LED_BIND_START_INDEX = MOTOR_BIND_START_INDEX + NUM_MOTORS;
-
-  static const Controller::ControllerBindingInfo s_binding_info[];
-
   Command m_command = Command::Idle;
-  u8 m_command_step = 0;
-  u8 m_response_length = 0;
+  int m_command_step = 0;
 
   // Transmit and receive buffers, not including the first Hi-Z/ack response byte
   static constexpr u32 MAX_RESPONSE_LENGTH = 8;
-  std::array<u8, MAX_RESPONSE_LENGTH> m_rx_buffer{};
-  std::array<u8, MAX_RESPONSE_LENGTH> m_tx_buffer{};
+  std::array<u8, MAX_RESPONSE_LENGTH> m_rx_buffer;
+  std::array<u8, MAX_RESPONSE_LENGTH> m_tx_buffer;
+  u32 m_response_length = 0;
 
   // Get number of response halfwords (excluding the initial controller info halfword)
   u8 GetResponseNumHalfwords() const;
@@ -121,43 +109,41 @@ private:
   u8 GetModeID() const;
   u8 GetIDByte() const;
 
-  void SetAnalogMode(bool enabled, bool show_message);
-  void ProcessAnalogModeToggle();
-  void SetMotorState(u32 motor, u8 value);
-  float GetMotorStrength(u32 motor) const;
-  u16 GetExtraButtonMask() const;
-  void ResetRumbleConfig();
-  void Poll();
+  // TODO: Return 0x00 on manual toggles
+  constexpr u8 GetStatusByte() const { return 0x5A; };
 
-  float m_analog_deadzone = 0.0f;
-  float m_analog_sensitivity = 1.33f;
-  float m_button_deadzone = 0.0f;
-  std::array<s16, NUM_MOTORS> m_vibration_bias{DEFAULT_LARGE_MOTOR_VIBRATION_BIAS, DEFAULT_SMALL_MOTOR_VIBRATION_BIAS};
-  u8 m_invert_left_stick = 0;
-  u8 m_invert_right_stick = 0;
+  void SetAnalogMode(bool enabled);
+  void ProcessAnalogModeToggle();
+  void SetMotorState(u8 motor, u8 value);
+  u8 GetExtraButtonMaskLSB() const;
+  void ResetRumbleConfig();
+  void SetMotorStateForConfigIndex(int index, u8 value);
+
+  u32 m_index;
 
   bool m_force_analog_on_reset = false;
   bool m_analog_dpad_in_digital_mode = false;
-  u8 m_analog_shoulder_buttons = 0;
-  u8 m_analog_trigger_buttons = 0;
+  float m_axis_scale = 1.00f;
+  u8 m_rumble_bias = 8;
 
   bool m_analog_mode = false;
   bool m_analog_locked = false;
-  bool m_dualshock_enabled = false;
+  bool m_rumble_unlocked = false;
   bool m_configuration_mode = false;
 
   std::array<u8, static_cast<u8>(Axis::Count)> m_axis_state{};
 
   enum : u8
   {
-    SmallMotor = 0,
-    LargeMotor = 1,
+    LargeMotor = 0,
+    SmallMotor = 1
   };
 
   std::array<u8, 6> m_rumble_config{};
+  int m_rumble_config_large_motor_index = -1;
+  int m_rumble_config_small_motor_index = -1;
 
   bool m_analog_toggle_queued = false;
-  u8 m_status_byte = 0;
 
   // TODO: Set this with command 0x4D and increase response length in digital mode accordingly
   u8 m_digital_mode_extra_halfwords = 0;
@@ -167,6 +153,7 @@ private:
 
   MotorState m_motor_state{};
 
-  // both directions of axis state, merged to m_axis_state
-  std::array<u8, static_cast<u32>(HalfAxis::Count)> m_half_axis_state{};
+  // Member variables that are no longer used, but kept and serialized for compatibility with older save states
+  u8 m_command_param = 0;
+  bool m_legacy_rumble_unlocked = false;
 };

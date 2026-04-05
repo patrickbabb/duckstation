@@ -1,18 +1,15 @@
 #ifndef RC_CONSOLES_H
 #define RC_CONSOLES_H
 
-#include "rc_export.h"
-
-#include <stdint.h>
-
-RC_BEGIN_C_DECLS
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /*****************************************************************************\
 | Console identifiers                                                         |
 \*****************************************************************************/
 
 enum {
-  RC_CONSOLE_UNKNOWN = 0,
   RC_CONSOLE_MEGA_DRIVE = 1,
   RC_CONSOLE_NINTENDO_64 = 2,
   RC_CONSOLE_SUPER_NINTENDO = 3,
@@ -75,64 +72,15 @@ enum {
   RC_CONSOLE_GAME_AND_WATCH = 60,
   RC_CONSOLE_NOKIA_NGAGE = 61,
   RC_CONSOLE_NINTENDO_3DS = 62,
-  RC_CONSOLE_SUPERVISION = 63,
-  RC_CONSOLE_SHARPX1 = 64,
-  RC_CONSOLE_TIC80 = 65,
-  RC_CONSOLE_THOMSONTO8 = 66,
-  RC_CONSOLE_PC6000 = 67,
-  RC_CONSOLE_PICO = 68,
-  RC_CONSOLE_MEGADUCK = 69,
-  RC_CONSOLE_ZEEBO = 70,
-  RC_CONSOLE_ARDUBOY = 71,
-  RC_CONSOLE_WASM4 = 72,
-  RC_CONSOLE_ARCADIA_2001 = 73,
-  RC_CONSOLE_INTERTON_VC_4000 = 74,
-  RC_CONSOLE_ELEKTOR_TV_GAMES_COMPUTER = 75,
-  RC_CONSOLE_PC_ENGINE_CD = 76,
-  RC_CONSOLE_ATARI_JAGUAR_CD = 77,
-  RC_CONSOLE_NINTENDO_DSI = 78,
-  RC_CONSOLE_TI83 = 79,
-  RC_CONSOLE_UZEBOX = 80,
-  RC_CONSOLE_FAMICOM_DISK_SYSTEM = 81,
 
   RC_CONSOLE_HUBS = 100,
-  RC_CONSOLE_EVENTS = 101,
-  RC_CONSOLE_STANDALONE = 102
+  RC_CONSOLE_EVENTS = 101
 };
 
-RC_EXPORT const char* RC_CCONV rc_console_name(uint32_t console_id);
+const char* rc_console_name(int console_id);
 
-/*****************************************************************************\
-| Memory mapping                                                              |
-\*****************************************************************************/
-
-enum {
-  RC_MEMORY_TYPE_SYSTEM_RAM,          /* normal system memory */
-  RC_MEMORY_TYPE_SAVE_RAM,            /* memory that persists between sessions */
-  RC_MEMORY_TYPE_VIDEO_RAM,           /* memory reserved for graphical processing */
-  RC_MEMORY_TYPE_READONLY,            /* memory that maps to read only data */
-  RC_MEMORY_TYPE_HARDWARE_CONTROLLER, /* memory for interacting with system components */
-  RC_MEMORY_TYPE_VIRTUAL_RAM,         /* secondary address space that maps to real memory in system RAM */
-  RC_MEMORY_TYPE_UNUSED               /* these addresses don't really exist */
-};
-
-typedef struct rc_memory_region_t {
-  uint32_t start_address;             /* first address of block as queried by RetroAchievements */
-  uint32_t end_address;               /* last address of block as queried by RetroAchievements */
-  uint32_t real_address;              /* real address for first address of block */
-  uint8_t type;                       /* RC_MEMORY_TYPE_ for block */
-  const char* description;            /* short description of block */
+#ifdef __cplusplus
 }
-rc_memory_region_t;
-
-typedef struct rc_memory_regions_t {
-  const rc_memory_region_t* region;
-  uint32_t num_regions;
-}
-rc_memory_regions_t;
-
-RC_EXPORT const rc_memory_regions_t* RC_CCONV rc_console_memory_regions(uint32_t console_id);
-
-RC_END_C_DECLS
+#endif
 
 #endif /* RC_CONSOLES_H */

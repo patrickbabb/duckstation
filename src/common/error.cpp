@@ -1,216 +1,179 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #include "error.h"
-#include "small_string.h"
-#include "string_util.h"
-
 #include <cstdlib>
 #include <cstring>
-#include <cwctype>
 #include <type_traits>
 
-#include "fmt/format.h"
-
+// Platform-specific includes
 #if defined(_WIN32)
 #include "windows_headers.h"
+static_assert(std::is_same<DWORD, unsigned long>::value, "DWORD is unsigned long");
+static_assert(std::is_same<HRESULT, long>::value, "HRESULT is long");
 #endif
 
-Error::Error() = default;
+namespace Common {
 
-Error::Error(const Error& c) = default;
+Error::Error() : m_type(Type::None)
+{
+  m_error.none = 0;
+}
 
-Error::Error(Error&& e) = default;
+Error::Error(const Error& c)
+{
+  m_type = c.m_type;
+  std::memcpy(&m_error, &c.m_error, sizeof(m_error));
+  m_code_string.AppendString(c.m_code_string);
+  m_message.AppendString(c.m_message);
+}
 
 Error::~Error() = default;
 
-bool Error::IsValid(Error* errptr)
-{
-  return (errptr && errptr->IsValid());
-}
-
 void Error::Clear()
 {
-  m_description = {};
-}
-
-void Error::Clear(Error* errptr)
-{
-  if (errptr)
-    errptr->Clear();
+  m_type = Type::None;
+  m_error.none = 0;
+  m_code_string.Clear();
+  m_message.Clear();
 }
 
 void Error::SetErrno(int err)
 {
-  SetErrno(std::string_view(), err);
-}
-
-void Error::SetErrno(std::string_view prefix, int err)
-{
   m_type = Type::Errno;
+  m_error.errno_f = err;
+
+  m_code_string.Format("%i", err);
 
 #ifdef _MSC_VER
-  char buf[128];
-  if (strerror_s(buf, sizeof(buf), err) == 0)
-    m_description = fmt::format("{}errno {}: {}", prefix, err, buf);
-  else
-    m_description = fmt::format("{}errno {}: <Could not get error message>", prefix, err);
+  strerror_s(m_message.GetWriteableCharArray(), m_message.GetBufferSize(), err);
+  m_message.UpdateSize();
 #else
-  const char* buf = std::strerror(err);
-  if (buf)
-    m_description = fmt::format("{}errno {}: {}", prefix, err, buf);
+  const char* message = std::strerror(err);
+  if (message)
+    m_message = message;
   else
-    m_description = fmt::format("{}errno {}: <Could not get error message>", prefix, err);
+    m_message = StaticString("<Could not get error message>");
 #endif
 }
 
-void Error::SetErrno(Error* errptr, int err)
+void Error::SetSocket(int err)
 {
-  if (errptr)
-    errptr->SetErrno(err);
+// Socket errors are win32 errors on windows
+#ifdef _WIN32
+  SetWin32(err);
+#else
+  SetErrno(err);
+#endif
 }
 
-void Error::SetErrno(Error* errptr, std::string_view prefix, int err)
-{
-  if (errptr)
-    errptr->SetErrno(prefix, err);
-}
-
-void Error::SetString(std::string description)
+void Error::SetMessage(const char* msg)
 {
   m_type = Type::User;
-  m_description = std::move(description);
+  m_error.user = 0;
+  m_code_string.Clear();
+  m_message = msg;
 }
 
-void Error::SetStringView(std::string_view description)
+void Error::SetUser(int err, const char* msg)
 {
   m_type = Type::User;
-  m_description = std::string(description);
+  m_error.user = err;
+  m_code_string.Format("%d", err);
+  m_message = msg;
 }
 
-void Error::SetString(Error* errptr, std::string description)
+void Error::SetUser(const char* code, const char* message)
 {
-  if (errptr)
-    errptr->SetString(std::move(description));
+  m_type = Type::User;
+  m_error.user = 0;
+  m_code_string = code;
+  m_message = message;
 }
 
-void Error::SetStringView(Error* errptr, std::string_view description)
+void Error::SetUserFormatted(int err, const char* format, ...)
 {
-  if (errptr)
-    errptr->SetStringView(std::move(description));
+  std::va_list ap;
+  va_start(ap, format);
+
+  m_type = Type::User;
+  m_error.user = err;
+  m_code_string.Format("%d", err);
+  m_message.FormatVA(format, ap);
+  va_end(ap);
+}
+
+void Error::SetUserFormatted(const char* code, const char* format, ...)
+{
+  std::va_list ap;
+  va_start(ap, format);
+
+  m_type = Type::User;
+  m_error.user = 0;
+  m_code_string = code;
+  m_message.FormatVA(format, ap);
+  va_end(ap);
+}
+
+void Error::SetFormattedMessage(const char* format, ...)
+{
+  std::va_list ap;
+  va_start(ap, format);
+
+  m_type = Type::User;
+  m_error.user = 0;
+  m_code_string.Clear();
+  m_message.FormatVA(format, ap);
+  va_end(ap);
 }
 
 #ifdef _WIN32
 
 void Error::SetWin32(unsigned long err)
 {
-  SetWin32(std::string_view(), err);
-}
-
-void Error::SetWin32(std::string_view prefix, unsigned long err)
-{
   m_type = Type::Win32;
+  m_error.win32 = err;
+  m_code_string.Format("%u", static_cast<u32>(err));
+  m_message.Clear();
 
-  WCHAR buf[128];
-  DWORD r = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM, nullptr, err, LANG_USER_DEFAULT, buf,
-                           static_cast<DWORD>(std::size(buf)), nullptr);
-  while (r > 0 && std::iswspace(buf[r - 1]))
-    r--;
-
+  const DWORD r = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, m_error.win32, 0, m_message.GetWriteableCharArray(),
+                                 m_message.GetWritableBufferSize(), NULL);
   if (r > 0)
   {
-    m_description =
-      fmt::format("{}Win32 Error {}: {}", prefix, err, StringUtil::WideStringToUTF8String(std::wstring_view(buf, r)));
+    m_message.Resize(r);
+    m_message.RStrip();
   }
   else
   {
-    m_description = fmt::format("{}Win32 Error {}: <Could not resolve system error ID>", prefix, err);
+    m_message = "<Could not resolve system error ID>";
   }
-}
-
-void Error::SetWin32(Error* errptr, unsigned long err)
-{
-  if (errptr)
-    errptr->SetWin32(err);
-}
-
-void Error::SetWin32(Error* errptr, std::string_view prefix, unsigned long err)
-{
-  if (errptr)
-    errptr->SetWin32(prefix, err);
 }
 
 void Error::SetHResult(long err)
 {
-  SetHResult(std::string_view(), err);
-}
-
-void Error::SetHResult(std::string_view prefix, long err)
-{
   m_type = Type::HResult;
+  m_error.win32 = err;
+  m_code_string.Format("%08X", static_cast<u32>(err));
+  m_message.Clear();
 
-  WCHAR buf[128];
-  DWORD r = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM, nullptr, err, LANG_USER_DEFAULT, buf,
-                           static_cast<DWORD>(std::size(buf)), nullptr);
-  while (r > 0 && std::iswspace(buf[r - 1]))
-    r--;
-
+  const DWORD r = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, m_error.win32, 0, m_message.GetWriteableCharArray(),
+                                 m_message.GetWritableBufferSize(), NULL);
   if (r > 0)
   {
-    m_description = fmt::format("{}HRESULT {:08X}: {}", prefix, static_cast<unsigned>(err),
-                                StringUtil::WideStringToUTF8String(std::wstring_view(buf, r)));
+    m_message.Resize(r);
+    m_message.RStrip();
   }
   else
   {
-    m_description = fmt::format("{}HRESULT {:08X}: <Could not resolve system error ID>", prefix, err);
+    m_message = "<Could not resolve system error ID>";
   }
 }
 
-void Error::SetHResult(Error* errptr, long err)
-{
-  if (errptr)
-    errptr->SetHResult(err);
-}
-
-void Error::SetHResult(Error* errptr, std::string_view prefix, long err)
-{
-  if (errptr)
-    errptr->SetHResult(prefix, err);
-}
-
 #endif
 
-void Error::SetSocket(int err)
-{
-  SetSocket(std::string_view(), err);
-}
-
-void Error::SetSocket(std::string_view prefix, int err)
-{
-  // Socket errors are win32 errors on windows
-#ifdef _WIN32
-  SetWin32(prefix, err);
-#else
-  SetErrno(prefix, err);
-#endif
-  m_type = Type::Socket;
-}
-
-void Error::SetSocket(Error* errptr, int err)
-{
-  if (errptr)
-    errptr->SetSocket(err);
-}
-
-void Error::SetSocket(Error* errptr, std::string_view prefix, int err)
-{
-  if (errptr)
-    errptr->SetSocket(prefix, err);
-}
-
+// constructors
 Error Error::CreateNone()
 {
-  return Error();
+  Error ret;
+  ret.Clear();
+  return ret;
 }
 
 Error Error::CreateErrno(int err)
@@ -227,10 +190,70 @@ Error Error::CreateSocket(int err)
   return ret;
 }
 
-Error Error::CreateString(std::string description)
+Error Error::CreateMessage(const char* msg)
 {
   Error ret;
-  ret.SetString(std::move(description));
+  ret.SetMessage(msg);
+  return ret;
+}
+
+Error Error::CreateUser(int err, const char* msg)
+{
+  Error ret;
+  ret.SetUser(err, msg);
+  return ret;
+}
+
+Error Error::CreateUser(const char* code, const char* message)
+{
+  Error ret;
+  ret.SetUser(code, message);
+  return ret;
+}
+
+Error Error::CreateMessageFormatted(const char* format, ...)
+{
+  std::va_list ap;
+  va_start(ap, format);
+
+  Error ret;
+  ret.m_type = Type::User;
+  ret.m_message.FormatVA(format, ap);
+
+  va_end(ap);
+
+  return ret;
+}
+
+Error Error::CreateUserFormatted(int err, const char* format, ...)
+{
+  std::va_list ap;
+  va_start(ap, format);
+
+  Error ret;
+  ret.m_type = Type::User;
+  ret.m_error.user = err;
+  ret.m_code_string.Format("%d", err);
+  ret.m_message.FormatVA(format, ap);
+
+  va_end(ap);
+
+  return ret;
+}
+
+Error Error::CreateUserFormatted(const char* code, const char* format, ...)
+{
+  std::va_list ap;
+  va_start(ap, format);
+
+  Error ret;
+  ret.m_type = Type::User;
+  ret.m_error.user = 0;
+  ret.m_code_string = code;
+  ret.m_message.FormatVA(format, ap);
+
+  va_end(ap);
+
   return ret;
 }
 
@@ -251,58 +274,86 @@ Error Error::CreateHResult(long err)
 
 #endif
 
-void Error::AddPrefix(std::string_view prefix)
+Error& Error::operator=(const Error& e)
 {
-  m_description.insert(0, prefix);
+  m_type = e.m_type;
+  std::memcpy(&m_error, &e.m_error, sizeof(m_error));
+  m_code_string.Clear();
+  m_code_string.AppendString(e.m_code_string);
+  m_message.Clear();
+  m_message.AppendString(e.m_message);
+  return *this;
 }
-
-void Error::AddSuffix(std::string_view suffix)
-{
-  m_description.append(suffix);
-}
-
-void Error::SetStringFmtArgs(fmt::string_view fmt, fmt::format_args args)
-{
-  m_type = Type::User;
-  m_description = fmt::vformat(fmt, std::move(args));
-}
-
-void Error::AddPrefixFmtArgs(fmt::string_view fmt, fmt::format_args args)
-{
-  SmallString str;
-  str.vformat(fmt, std::move(args));
-  AddPrefix(str.view());
-}
-
-void Error::AddSuffixFmtArgs(fmt::string_view fmt, fmt::format_args args)
-{
-  SmallString str;
-  str.vformat(fmt, std::move(args));
-  AddSuffix(str.view());
-}
-
-void Error::AddPrefix(Error* errptr, std::string_view prefix)
-{
-  if (errptr)
-    errptr->AddPrefix(prefix);
-}
-
-void Error::AddSuffix(Error* errptr, std::string_view prefix)
-{
-  if (errptr)
-    errptr->AddSuffix(prefix);
-}
-
-Error& Error::operator=(const Error& e) = default;
-
-Error& Error::operator=(Error&& e) = default;
 
 bool Error::operator==(const Error& e) const
 {
-  return (m_type == e.m_type && m_description == e.m_description);
+  switch (m_type)
+  {
+    case Type::None:
+      return true;
+
+    case Type::Errno:
+      return m_error.errno_f == e.m_error.errno_f;
+
+    case Type::Socket:
+      return m_error.socketerr == e.m_error.socketerr;
+
+    case Type::User:
+      return m_error.user == e.m_error.user;
+
+#ifdef _WIN32
+    case Type::Win32:
+      return m_error.win32 == e.m_error.win32;
+
+    case Type::HResult:
+      return m_error.hresult == e.m_error.hresult;
+#endif
+  }
+
+  return false;
 }
 
 bool Error::operator!=(const Error& e) const
 {
-  return (m_type != e.m_type || m_description != e.m_description);
+  switch (m_type)
+  {
+    case Type::None:
+      return false;
+
+    case Type::Errno:
+      return m_error.errno_f != e.m_error.errno_f;
+
+    case Type::Socket:
+      return m_error.socketerr != e.m_error.socketerr;
+
+    case Type::User:
+      return m_error.user != e.m_error.user;
+
+#ifdef _WIN32
+    case Type::Win32:
+      return m_error.win32 != e.m_error.win32;
+
+    case Type::HResult:
+      return m_error.hresult != e.m_error.hresult;
+#endif
+  }
+
+  return true;
 }
+
+SmallString Error::GetCodeAndMessage() const
+{
+  SmallString ret;
+  GetCodeAndMessage(ret);
+  return ret;
+}
+
+void Error::GetCodeAndMessage(String& dest) const
+{
+  if (m_code_string.IsEmpty())
+    dest.Assign(m_message);
+  else
+    dest.Format("[%s]: %s", m_code_string.GetCharArray(), m_message.GetCharArray());
+}
+
+} // namespace Common

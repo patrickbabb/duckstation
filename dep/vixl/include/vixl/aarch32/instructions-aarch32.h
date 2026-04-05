@@ -36,12 +36,11 @@ extern "C" {
 
 #include "../code-buffer-vixl.h"
 #include "../utils-vixl.h"
+
 #include "constants-aarch32.h"
 
-#if defined(__arm__) && !defined(__SOFTFP__)
+#ifdef __arm__
 #define HARDFLOAT __attribute__((noinline, pcs("aapcs-vfp")))
-#elif defined(_MSC_VER)
-#define HARDFLOAT __declspec(noinline)
 #else
 #define HARDFLOAT __attribute__((noinline))
 #endif
@@ -493,8 +492,6 @@ class RegisterList {
   }
   Register GetFirstAvailableRegister() const;
   bool IsEmpty() const { return list_ == 0; }
-  bool IsSingleRegister() const { return IsPowerOf2(list_); }
-  int GetCount() const { return CountSetBits(list_); }
   static RegisterList Union(const RegisterList& list_1,
                             const RegisterList& list_2) {
     return RegisterList(list_1.list_ | list_2.list_);
@@ -1042,9 +1039,7 @@ class Sign {
   const char* GetName() const { return (IsPlus() ? "" : "-"); }
   bool IsPlus() const { return sign_ == plus; }
   bool IsMinus() const { return sign_ == minus; }
-  int32_t ApplyTo(uint32_t value) {
-    return IsPlus() ? value : UnsignedNegate(value);
-  }
+  int32_t ApplyTo(uint32_t value) { return IsPlus() ? value : -value; }
 
  private:
   SignType sign_;

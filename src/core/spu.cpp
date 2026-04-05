@@ -1,587 +1,96 @@
-// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #include "spu.h"
 #include "cdrom.h"
+#include "common/audio_stream.h"
+#include "common/log.h"
+#include "common/state_wrapper.h"
+#include "common/wav_writer.h"
 #include "dma.h"
-#include "imgui_overlays.h"
+#include "host_interface.h"
 #include "interrupt_controller.h"
 #include "system.h"
-#include "timing_event.h"
-
-#include "util/audio_stream.h"
-#include "util/imgui_manager.h"
-#include "util/media_capture.h"
-#include "util/state_wrapper.h"
-#include "util/translation.h"
-#include "util/wav_reader_writer.h"
-
-#include "common/bitfield.h"
-#include "common/bitutils.h"
-#include "common/error.h"
-#include "common/fifo_queue.h"
-#include "common/gsvector.h"
-#include "common/log.h"
-#include "common/path.h"
-
-#include "IconsEmoji.h"
-#include "fmt/format.h"
+#ifdef WITH_IMGUI
 #include "imgui.h"
-
-#include <memory>
-
-LOG_CHANNEL(SPU);
-
-// Enable to dump all voices of the SPU audio individually.
-// #define SPU_DUMP_ALL_VOICES 1
-
-// VU meter is only enabled in devel builds due to speed impact.
-#if defined(_DEBUG) || defined(_DEVEL)
-#define SPU_ENABLE_VU_METER 1
 #endif
+Log_SetChannel(SPU);
 
-ALWAYS_INLINE static constexpr s32 Clamp16(s32 value)
-{
-  return (value < -0x8000) ? -0x8000 : (value > 0x7FFF) ? 0x7FFF : value;
-}
+SPU g_spu;
 
-ALWAYS_INLINE static constexpr s32 ApplyVolume(s32 sample, s16 volume)
-{
-  return (sample * s32(volume)) >> 15;
-}
+SPU::SPU() = default;
 
-namespace SPU {
-namespace {
-
-enum : u32
-{
-  SPU_BASE = 0x1F801C00,
-  NUM_VOICES = 24,
-  NUM_VOICE_REGISTERS = 8,
-  VOICE_ADDRESS_SHIFT = 3,
-  NUM_SAMPLES_PER_ADPCM_BLOCK = 28,
-  NUM_SAMPLES_FROM_LAST_ADPCM_BLOCK = 3,
-  SYSCLK_TICKS_PER_SPU_TICK = static_cast<u32>(System::MASTER_CLOCK) / static_cast<u32>(SAMPLE_RATE), // 0x300
-  CAPTURE_BUFFER_SIZE_PER_CHANNEL = 0x400,
-  MINIMUM_TICKS_BETWEEN_KEY_ON_OFF = 2,
-  NUM_REVERB_REGS = 32,
-  FIFO_SIZE_IN_HALFWORDS = 32
-};
-enum : TickCount
-{
-  TRANSFER_TICKS_PER_HALFWORD = 16
-};
-
-enum class RAMTransferMode : u8
-{
-  Stopped = 0,
-  ManualWrite = 1,
-  DMAWrite = 2,
-  DMARead = 3
-};
-
-union SPUCNTRegister
-{
-  u16 bits;
-
-  BitField<u16, bool, 15, 1> enable;
-  BitField<u16, bool, 14, 1> mute_n;
-  BitField<u16, u8, 8, 6> noise_clock;
-  BitField<u16, bool, 7, 1> reverb_master_enable;
-  BitField<u16, bool, 6, 1> irq9_enable;
-  BitField<u16, RAMTransferMode, 4, 2> ram_transfer_mode;
-  BitField<u16, bool, 3, 1> external_audio_reverb;
-  BitField<u16, bool, 2, 1> cd_audio_reverb;
-  BitField<u16, bool, 1, 1> external_audio_enable;
-  BitField<u16, bool, 0, 1> cd_audio_enable;
-
-  BitField<u16, u8, 0, 6> mode;
-};
-
-union SPUSTATRegister
-{
-  u16 bits;
-
-  BitField<u16, bool, 11, 1> second_half_capture_buffer;
-  BitField<u16, bool, 10, 1> transfer_busy;
-  BitField<u16, bool, 9, 1> dma_write_request;
-  BitField<u16, bool, 8, 1> dma_read_request;
-  BitField<u16, bool, 7, 1> dma_request;
-  BitField<u16, bool, 6, 1> irq9_flag;
-  BitField<u16, u8, 0, 6> mode;
-};
-
-union TransferControl
-{
-  u16 bits;
-
-  BitField<u8, u8, 1, 3> mode;
-};
-
-union ADSRRegister
-{
-  u32 bits;
-  struct
-  {
-    u16 bits_low;
-    u16 bits_high;
-  };
-
-  BitField<u32, u8, 0, 4> sustain_level;
-  BitField<u32, u8, 4, 4> decay_rate_shr2;
-  BitField<u32, u8, 8, 7> attack_rate;
-  BitField<u32, bool, 15, 1> attack_exponential;
-
-  BitField<u32, u8, 16, 5> release_rate_shr2;
-  BitField<u32, bool, 21, 1> release_exponential;
-  BitField<u32, u8, 22, 7> sustain_rate;
-  BitField<u32, bool, 30, 1> sustain_direction_decrease;
-  BitField<u32, bool, 31, 1> sustain_exponential;
-};
-
-union VolumeRegister
-{
-  u16 bits;
-
-  BitField<u16, bool, 15, 1> sweep_mode;
-  BitField<u16, s16, 0, 15> fixed_volume_shr1; // divided by 2
-
-  BitField<u16, bool, 14, 1> sweep_exponential;
-  BitField<u16, bool, 13, 1> sweep_direction_decrease;
-  BitField<u16, bool, 12, 1> sweep_phase_negative;
-  BitField<u16, u8, 0, 7> sweep_rate;
-};
-
-// organized so we can replace this with a u16 array in the future
-union VoiceRegisters
-{
-  u16 index[NUM_VOICE_REGISTERS];
-
-  struct
-  {
-    VolumeRegister volume_left;
-    VolumeRegister volume_right;
-
-    u16 adpcm_sample_rate;   // VxPitch
-    u16 adpcm_start_address; // multiply by 8
-
-    ADSRRegister adsr;
-    s16 adsr_volume;
-
-    u16 adpcm_repeat_address; // multiply by 8
-  };
-};
-
-union VoiceCounter
-{
-  // promoted to u32 because of overflow
-  u32 bits;
-
-  BitField<u32, u8, 4, 8> interpolation_index;
-  BitField<u32, u8, 12, 5> sample_index;
-};
-
-union ADPCMFlags
-{
-  u8 bits;
-
-  BitField<u8, bool, 0, 1> loop_end;
-  BitField<u8, bool, 1, 1> loop_repeat;
-  BitField<u8, bool, 2, 1> loop_start;
-};
-
-struct ADPCMBlock
-{
-  union
-  {
-    u8 bits;
-
-    BitField<u8, u8, 0, 4> shift;
-    BitField<u8, u8, 4, 4> filter;
-  } shift_filter;
-  ADPCMFlags flags;
-  u8 data[NUM_SAMPLES_PER_ADPCM_BLOCK / 2];
-
-  // For both 4bit and 8bit ADPCM, reserved shift values 13..15 will act same as shift=9).
-  u8 GetShift() const
-  {
-    const u8 shift = shift_filter.shift;
-    return (shift > 12) ? 9 : shift;
-  }
-
-  u8 GetFilter() const { return shift_filter.filter; }
-
-  u8 GetNibble(u32 index) const { return (data[index / 2] >> ((index % 2) * 4)) & 0x0F; }
-};
-
-struct VolumeEnvelope
-{
-  static constexpr s32 MIN_VOLUME = -32768;
-  static constexpr s32 MAX_VOLUME = 32767;
-
-  u32 counter;
-  u16 counter_increment;
-  s16 step;
-  u8 rate;
-  bool decreasing;
-  bool exponential;
-  bool phase_invert;
-
-  void Reset(u8 rate_, u8 rate_mask_, bool decreasing_, bool exponential_, bool phase_invert_);
-  bool Tick(s16& current_level);
-};
-
-struct VolumeSweep
-{
-  VolumeEnvelope envelope;
-  s16 current_level;
-  bool envelope_active;
-
-  void Reset(VolumeRegister reg);
-  void Tick();
-};
-
-enum class ADSRPhase : u8
-{
-  Off = 0,
-  Attack = 1,
-  Decay = 2,
-  Sustain = 3,
-  Release = 4
-};
-
-struct Voice
-{
-  u16 current_address;
-  VoiceRegisters regs;
-  VoiceCounter counter;
-  ADPCMFlags current_block_flags;
-  bool is_first_block;
-  std::array<s16, NUM_SAMPLES_FROM_LAST_ADPCM_BLOCK + NUM_SAMPLES_PER_ADPCM_BLOCK> current_block_samples;
-  std::array<s16, 2> adpcm_last_samples;
-  s32 last_volume;
-
-  VolumeSweep left_volume;
-  VolumeSweep right_volume;
-
-  VolumeEnvelope adsr_envelope;
-  ADSRPhase adsr_phase;
-  s16 adsr_target;
-  bool has_samples;
-  bool ignore_loop_address;
-
-  bool IsOn() const { return adsr_phase != ADSRPhase::Off; }
-
-  void KeyOn();
-  void KeyOff();
-  void ForceOff();
-
-  void DecodeBlock(const ADPCMBlock& block);
-  s32 Interpolate() const;
-
-  // Switches to the specified phase, filling in target.
-  void UpdateADSREnvelope();
-
-  // Updates the ADSR volume/phase.
-  void TickADSR();
-};
-
-struct ReverbRegisters
-{
-  s16 vLOUT;
-  s16 vROUT;
-  u16 mBASE;
-
-  union
-  {
-    struct
-    {
-      u16 FB_SRC_A;
-      u16 FB_SRC_B;
-      s16 IIR_ALPHA;
-      s16 ACC_COEF_A;
-      s16 ACC_COEF_B;
-      s16 ACC_COEF_C;
-      s16 ACC_COEF_D;
-      s16 IIR_COEF;
-      s16 FB_ALPHA;
-      s16 FB_X;
-      u16 IIR_DEST_A[2];
-      u16 ACC_SRC_A[2];
-      u16 ACC_SRC_B[2];
-      u16 IIR_SRC_A[2];
-      u16 IIR_DEST_B[2];
-      u16 ACC_SRC_C[2];
-      u16 ACC_SRC_D[2];
-      u16 IIR_SRC_B[2];
-      u16 MIX_DEST_A[2];
-      u16 MIX_DEST_B[2];
-      s16 IN_COEF[2];
-    };
-
-    u16 rev[NUM_REVERB_REGS];
-  };
-};
-} // namespace
-
-template<bool COMPATIBILITY>
-static bool DoCompatibleState(StateWrapper& sw);
-
-static ADSRPhase GetNextADSRPhase(ADSRPhase phase);
-
-static bool IsVoiceReverbEnabled(u32 i);
-static bool IsVoiceNoiseEnabled(u32 i);
-static bool IsPitchModulationEnabled(u32 i);
-static s16 GetVoiceNoiseLevel();
-
-static u16 ReadVoiceRegister(u32 offset);
-static void WriteVoiceRegister(u32 offset, u16 value);
-
-static bool IsRAMIRQTriggerable();
-static bool CheckRAMIRQ(u32 address);
-static void TriggerRAMIRQ();
-static void CheckForLateRAMIRQs();
-
-static void WriteToCaptureBuffer(u32 index, s16 value);
-static void IncrementCaptureBufferPosition();
-
-static void ReadADPCMBlock(u16 address, ADPCMBlock* block);
-static std::tuple<s32, s32> SampleVoice(u32 voice_index);
-
-static void UpdateNoise();
-
-static u32 ReverbMemoryAddress(u32 address);
-static s16 ReverbRead(u32 address, s32 offset = 0);
-static void ReverbWrite(u32 address, s16 data);
-static void ProcessReverb(s32 left_in, s32 right_in, s32* left_out, s32* right_out);
-
-static void InternalGeneratePendingSamples();
-static void Execute(void* param, TickCount ticks, TickCount ticks_late);
-static void UpdateEventInterval();
-
-static void ExecuteFIFOWriteToRAM(TickCount& ticks);
-static void ExecuteFIFOReadFromRAM(TickCount& ticks);
-static void ExecuteTransfer(void* param, TickCount ticks, TickCount ticks_late);
-static void ManualTransferWrite(u16 value);
-static void UpdateTransferEvent();
-static void UpdateDMARequest();
-
-namespace {
-struct ALIGN_TO_CACHE_LINE SPUState
-{
-  TimingEvent transfer_event{"SPU Transfer", TRANSFER_TICKS_PER_HALFWORD, TRANSFER_TICKS_PER_HALFWORD,
-                             &SPU::ExecuteTransfer, nullptr};
-  TimingEvent tick_event{"SPU Sample", SYSCLK_TICKS_PER_SPU_TICK, SYSCLK_TICKS_PER_SPU_TICK, &SPU::Execute, nullptr};
-
-  TickCount ticks_carry = 0;
-  TickCount cpu_ticks_per_spu_tick = 0;
-  TickCount cpu_tick_divider = 0;
-
-  SPUCNTRegister SPUCNT = {};
-  SPUSTATRegister SPUSTAT = {};
-
-  TransferControl transfer_control = {};
-  u16 transfer_address_reg = 0;
-  u32 transfer_address = 0;
-
-  u16 irq_address = 0;
-  u16 capture_buffer_position = 0;
-
-  VolumeRegister main_volume_left_reg = {};
-  VolumeRegister main_volume_right_reg = {};
-  VolumeSweep main_volume_left = {};
-  VolumeSweep main_volume_right = {};
-
-  s16 cd_audio_volume_left = 0;
-  s16 cd_audio_volume_right = 0;
-
-  s16 external_volume_left = 0;
-  s16 external_volume_right = 0;
-
-  u32 key_on_register = 0;
-  u32 key_off_register = 0;
-  u32 endx_register = 0;
-  u32 pitch_modulation_enable_register = 0;
-
-  u32 noise_mode_register = 0;
-  u32 noise_count = 0;
-  u32 noise_level = 0;
-
-  u32 reverb_on_register = 0;
-  u32 reverb_base_address = 0;
-  u32 reverb_current_address = 0;
-  ReverbRegisters reverb_registers{};
-  std::array<std::array<s16, 128>, 2> reverb_downsample_buffer;
-  std::array<std::array<s16, 64>, 2> reverb_upsample_buffer;
-  s32 reverb_resample_buffer_position = 0;
-
-  s16 last_reverb_input[2];
-  s32 last_reverb_output[2];
-  bool audio_output_muted = false;
-
-  ALIGN_TO_CACHE_LINE std::array<Voice, NUM_VOICES> voices{};
-
-  InlineFIFOQueue<u16, FIFO_SIZE_IN_HALFWORDS> transfer_fifo;
-
-  CoreAudioStream audio_stream;
-
-#ifdef SPU_DUMP_ALL_VOICES
-  // +1 for reverb output
-  std::array<std::unique_ptr<WAVWriter>, NUM_VOICES + 1> s_voice_dump_writers;
-#endif
-
-#ifdef SPU_ENABLE_VU_METER
-  s16 output_peaks[2] = {};
-  s16 cd_audio_peaks[2] = {};
-  s16 reverb_peaks[2] = {};
-  s16 voice_peaks[NUM_VOICES][2] = {};
-#endif
-};
-} // namespace
-
-static SPUState s_state;
-ALIGN_TO_CACHE_LINE static std::array<u8, RAM_SIZE> s_ram{};
-ALIGN_TO_CACHE_LINE static std::array<s16, (44100 / 60) * 2> s_muted_output_buffer{};
-
-} // namespace SPU
-
-#ifdef SPU_ENABLE_VU_METER
-
-static bool IsVUMeterActive()
-{
-  return ImGuiManager::IsSPUDebugWindowEnabled();
-}
-
-ALWAYS_INLINE_RELEASE static void UpdateDebugPeaks(s16 peaks[2], s32 left, s32 right)
-{
-  peaks[0] = std::max(static_cast<s16>(std::abs(Clamp16(left))), peaks[0]);
-  peaks[1] = std::max(static_cast<s16>(std::abs(Clamp16(right))), peaks[1]);
-}
-
-#endif
+SPU::~SPU() = default;
 
 void SPU::Initialize()
 {
   // (X * D) / N / 768 -> (X * D) / (N * 768)
-  s_state.cpu_ticks_per_spu_tick = System::ScaleTicksToOverclock(SYSCLK_TICKS_PER_SPU_TICK);
-  s_state.cpu_tick_divider = static_cast<TickCount>(g_settings.cpu_overclock_numerator * SYSCLK_TICKS_PER_SPU_TICK);
-  s_state.tick_event.SetInterval(s_state.cpu_ticks_per_spu_tick);
-  s_state.tick_event.SetPeriod(s_state.cpu_ticks_per_spu_tick);
+  m_cpu_ticks_per_spu_tick = System::ScaleTicksToOverclock(SYSCLK_TICKS_PER_SPU_TICK);
+  m_cpu_tick_divider = static_cast<TickCount>(g_settings.cpu_overclock_numerator * SYSCLK_TICKS_PER_SPU_TICK);
+  m_tick_event = TimingEvents::CreateTimingEvent(
+    "SPU Sample", m_cpu_ticks_per_spu_tick, m_cpu_ticks_per_spu_tick,
+    [](void* param, TickCount ticks, TickCount ticks_late) { static_cast<SPU*>(param)->Execute(ticks); }, this, false);
+  m_transfer_event = TimingEvents::CreateTimingEvent(
+    "SPU Transfer", TRANSFER_TICKS_PER_HALFWORD, TRANSFER_TICKS_PER_HALFWORD,
+    [](void* param, TickCount ticks, TickCount ticks_late) { static_cast<SPU*>(param)->ExecuteTransfer(ticks); }, this,
+    false);
+  m_audio_stream = g_host_interface->GetAudioStream();
 
-  CreateOutputStream();
   Reset();
-
-#ifdef SPU_DUMP_ALL_VOICES
-  {
-    const std::string base_path = System::GetNewMediaCapturePath(System::GetGameTitle(), "wav");
-    for (size_t i = 0; i < s_state.s_voice_dump_writers.size(); i++)
-    {
-      s_state.s_voice_dump_writers[i].reset();
-      s_state.s_voice_dump_writers[i] = std::make_unique<WAVWriter>();
-
-      TinyString new_suffix;
-      if (i == NUM_VOICES)
-        new_suffix.assign("reverb.wav");
-      else
-        new_suffix.format("voice{}.wav", i);
-
-      const std::string voice_filename = Path::ReplaceExtension(base_path, new_suffix);
-      if (!s_state.s_voice_dump_writers[i]->Open(voice_filename.c_str(), SAMPLE_RATE, 2))
-      {
-        ERROR_LOG("Failed to open voice dump filename '{}'", voice_filename.c_str());
-        s_state.s_voice_dump_writers[i].reset();
-      }
-    }
-  }
-#endif
-}
-
-void SPU::CreateOutputStream()
-{
-  INFO_LOG("Creating '{}' audio stream, sample rate = {}, buffer = {}, latency = {}{}, stretching = {}",
-           AudioStream::GetBackendName(g_settings.audio_backend), static_cast<u32>(SAMPLE_RATE),
-           g_settings.audio_stream_parameters.buffer_ms, g_settings.audio_stream_parameters.output_latency_ms,
-           g_settings.audio_stream_parameters.output_latency_minimal ? " (or minimal)" : "",
-           CoreAudioStream::GetStretchModeName(g_settings.audio_stream_parameters.stretch_mode));
-
-  Error error;
-  if (!s_state.audio_stream.Initialize(g_settings.audio_backend, SAMPLE_RATE, g_settings.audio_stream_parameters,
-                                       g_settings.audio_driver, g_settings.audio_output_device, &error))
-  {
-    Host::AddIconOSDMessage(
-      OSDMessageType::Error, "SPUAudioStream", ICON_EMOJI_WARNING,
-      fmt::format(
-        TRANSLATE_FS("SPU",
-                     "Failed to create or configure audio stream, falling back to null output. The error was:\n{}"),
-        error.GetDescription()));
-    s_state.audio_stream.Initialize(AudioBackend::Null, SAMPLE_RATE, g_settings.audio_stream_parameters, {}, {},
-                                    nullptr);
-  }
-
-  s_state.audio_stream.SetOutputVolume(System::GetAudioOutputVolume());
-  s_state.audio_stream.SetNominalRate(System::GetAudioNominalRate());
-  s_state.audio_stream.SetPaused(System::IsPaused());
 }
 
 void SPU::CPUClockChanged()
 {
   // (X * D) / N / 768 -> (X * D) / (N * 768)
-  s_state.cpu_ticks_per_spu_tick = System::ScaleTicksToOverclock(SYSCLK_TICKS_PER_SPU_TICK);
-  s_state.cpu_tick_divider = static_cast<TickCount>(g_settings.cpu_overclock_numerator * SYSCLK_TICKS_PER_SPU_TICK);
-  s_state.ticks_carry = 0;
+  m_cpu_ticks_per_spu_tick = System::ScaleTicksToOverclock(SYSCLK_TICKS_PER_SPU_TICK);
+  m_cpu_tick_divider = static_cast<TickCount>(g_settings.cpu_overclock_numerator * SYSCLK_TICKS_PER_SPU_TICK);
+  m_ticks_carry = 0;
   UpdateEventInterval();
 }
 
 void SPU::Shutdown()
 {
-#ifdef SPU_DUMP_ALL_VOICES
-  for (size_t i = 0; i < s_state.s_voice_dump_writers.size(); i++)
-    s_state.s_voice_dump_writers[i].reset();
-#endif
-
-  s_state.tick_event.Deactivate();
-  s_state.transfer_event.Deactivate();
-  s_state.audio_stream.Destroy();
+  m_tick_event.reset();
+  m_transfer_event.reset();
+  m_dump_writer.reset();
+  m_audio_stream = nullptr;
 }
 
 void SPU::Reset()
 {
-  s_state.ticks_carry = 0;
+  m_ticks_carry = 0;
 
-  s_state.SPUCNT.bits = 0;
-  s_state.SPUSTAT.bits = 0;
-  s_state.transfer_address = 0;
-  s_state.transfer_address_reg = 0;
-  s_state.irq_address = 0;
-  s_state.capture_buffer_position = 0;
-  s_state.main_volume_left_reg.bits = 0;
-  s_state.main_volume_right_reg.bits = 0;
-  s_state.main_volume_left = {};
-  s_state.main_volume_right = {};
-  s_state.cd_audio_volume_left = 0;
-  s_state.cd_audio_volume_right = 0;
-  s_state.external_volume_left = 0;
-  s_state.external_volume_right = 0;
-  s_state.key_on_register = 0;
-  s_state.key_off_register = 0;
-  s_state.endx_register = 0;
-  s_state.pitch_modulation_enable_register = 0;
+  m_SPUCNT.bits = 0;
+  m_SPUSTAT.bits = 0;
+  m_transfer_address = 0;
+  m_transfer_address_reg = 0;
+  m_irq_address = 0;
+  m_capture_buffer_position = 0;
+  m_main_volume_left_reg.bits = 0;
+  m_main_volume_right_reg.bits = 0;
+  m_main_volume_left = {};
+  m_main_volume_right = {};
+  m_cd_audio_volume_left = 0;
+  m_cd_audio_volume_right = 0;
+  m_external_volume_left = 0;
+  m_external_volume_right = 0;
+  m_key_on_register = 0;
+  m_key_off_register = 0;
+  m_endx_register = 0;
+  m_pitch_modulation_enable_register = 0;
 
-  s_state.noise_mode_register = 0;
-  s_state.noise_count = 0;
-  s_state.noise_level = 1;
+  m_noise_mode_register = 0;
+  m_noise_count = 0;
+  m_noise_level = 1;
 
-  s_state.reverb_on_register = 0;
-  s_state.reverb_registers = {};
-  s_state.reverb_registers.mBASE = 0;
-  s_state.reverb_base_address = s_state.reverb_current_address = ZeroExtend32(s_state.reverb_registers.mBASE) << 2;
-  s_state.reverb_downsample_buffer = {};
-  s_state.reverb_upsample_buffer = {};
-  s_state.reverb_resample_buffer_position = 0;
+  m_reverb_on_register = 0;
+  m_reverb_registers = {};
+  m_reverb_registers.mBASE = 0;
+  m_reverb_base_address = m_reverb_current_address = ZeroExtend32(m_reverb_registers.mBASE) << 2;
+  m_reverb_downsample_buffer = {};
+  m_reverb_upsample_buffer = {};
+  m_reverb_resample_buffer_position = 0;
 
   for (u32 i = 0; i < NUM_VOICES; i++)
   {
-    Voice& v = s_state.voices[i];
+    Voice& v = m_voices[i];
     v.current_address = 0;
     std::fill_n(v.regs.index, NUM_VOICE_REGISTERS, u16(0));
     v.counter.bits = 0;
@@ -589,133 +98,79 @@ void SPU::Reset()
     v.is_first_block = 0;
     v.current_block_samples.fill(s16(0));
     v.adpcm_last_samples.fill(s32(0));
-    v.adsr_envelope.Reset(0, 0, false, false, false);
+    v.adsr_envelope.Reset(0, false, false);
     v.adsr_phase = ADSRPhase::Off;
     v.adsr_target = 0;
     v.has_samples = false;
     v.ignore_loop_address = false;
   }
 
-  s_state.tick_event.Deactivate();
-  s_state.transfer_event.Deactivate();
-  s_state.transfer_fifo.Clear();
-  s_ram.fill(0);
+  m_transfer_fifo.Clear();
+  m_transfer_event->Deactivate();
+  m_ram.fill(0);
   UpdateEventInterval();
 }
 
-template<bool COMPATIBILITY>
-bool SPU::DoCompatibleState(StateWrapper& sw)
+bool SPU::DoState(StateWrapper& sw)
 {
-  struct OldEnvelope
-  {
-    s32 counter;
-    u8 rate;
-    bool decreasing;
-    bool exponential;
-    bool phase_invert;
-  };
-  struct OldSweep
-  {
-    OldEnvelope env;
-    bool envelope_active;
-    s16 current_level;
-  };
-
-  static constexpr const auto do_compatible_volume_envelope = [](StateWrapper& sw, VolumeEnvelope* env) {
-    if constexpr (COMPATIBILITY)
-    {
-      if (sw.GetVersion() < 70) [[unlikely]]
-      {
-        OldEnvelope oenv;
-        sw.DoPOD(&oenv);
-        env->Reset(oenv.rate, 0x7f, oenv.decreasing, oenv.exponential, oenv.phase_invert);
-        env->counter = oenv.counter; // wrong
-        return;
-      }
-    }
-
-    sw.DoPOD(env);
-  };
-  static constexpr const auto do_compatible_volume_sweep = [](StateWrapper& sw, VolumeSweep* sweep) {
-    if constexpr (COMPATIBILITY)
-    {
-      if (sw.GetVersion() < 70) [[unlikely]]
-      {
-        OldSweep osweep;
-        sw.DoPOD(&osweep);
-        sweep->envelope.Reset(osweep.env.rate, 0x7f, osweep.env.decreasing, osweep.env.exponential,
-                              osweep.env.phase_invert);
-        sweep->envelope.counter = osweep.env.counter; // wrong
-        sweep->envelope_active = osweep.envelope_active;
-        sweep->current_level = osweep.current_level;
-        return;
-      }
-    }
-
-    sw.DoPOD(sweep);
-  };
-
-  sw.Do(&s_state.ticks_carry);
-  sw.Do(&s_state.SPUCNT.bits);
-  sw.Do(&s_state.SPUSTAT.bits);
-  sw.Do(&s_state.transfer_control.bits);
-  sw.Do(&s_state.transfer_address);
-  sw.Do(&s_state.transfer_address_reg);
-  sw.Do(&s_state.irq_address);
-  sw.Do(&s_state.capture_buffer_position);
-  sw.Do(&s_state.main_volume_left_reg.bits);
-  sw.Do(&s_state.main_volume_right_reg.bits);
-  do_compatible_volume_sweep(sw, &s_state.main_volume_left);
-  do_compatible_volume_sweep(sw, &s_state.main_volume_right);
-  sw.Do(&s_state.cd_audio_volume_left);
-  sw.Do(&s_state.cd_audio_volume_right);
-  sw.Do(&s_state.external_volume_left);
-  sw.Do(&s_state.external_volume_right);
-  sw.Do(&s_state.key_on_register);
-  sw.Do(&s_state.key_off_register);
-  sw.Do(&s_state.endx_register);
-  sw.Do(&s_state.pitch_modulation_enable_register);
-  sw.Do(&s_state.noise_mode_register);
-  sw.Do(&s_state.noise_count);
-  sw.Do(&s_state.noise_level);
-  sw.Do(&s_state.reverb_on_register);
-  sw.Do(&s_state.reverb_base_address);
-  sw.Do(&s_state.reverb_current_address);
-  sw.Do(&s_state.reverb_registers.vLOUT);
-  sw.Do(&s_state.reverb_registers.vROUT);
-  sw.Do(&s_state.reverb_registers.mBASE);
-  sw.DoArray(s_state.reverb_registers.rev, NUM_REVERB_REGS);
+  sw.Do(&m_ticks_carry);
+  sw.Do(&m_SPUCNT.bits);
+  sw.Do(&m_SPUSTAT.bits);
+  sw.Do(&m_transfer_control.bits);
+  sw.Do(&m_transfer_address);
+  sw.Do(&m_transfer_address_reg);
+  sw.Do(&m_irq_address);
+  sw.Do(&m_capture_buffer_position);
+  sw.Do(&m_main_volume_left_reg.bits);
+  sw.Do(&m_main_volume_right_reg.bits);
+  sw.DoPOD(&m_main_volume_left);
+  sw.DoPOD(&m_main_volume_right);
+  sw.Do(&m_cd_audio_volume_left);
+  sw.Do(&m_cd_audio_volume_right);
+  sw.Do(&m_external_volume_left);
+  sw.Do(&m_external_volume_right);
+  sw.Do(&m_key_on_register);
+  sw.Do(&m_key_off_register);
+  sw.Do(&m_endx_register);
+  sw.Do(&m_pitch_modulation_enable_register);
+  sw.Do(&m_noise_mode_register);
+  sw.Do(&m_noise_count);
+  sw.Do(&m_noise_level);
+  sw.Do(&m_reverb_on_register);
+  sw.Do(&m_reverb_base_address);
+  sw.Do(&m_reverb_current_address);
+  sw.Do(&m_reverb_registers.vLOUT);
+  sw.Do(&m_reverb_registers.vROUT);
+  sw.Do(&m_reverb_registers.mBASE);
+  sw.DoArray(m_reverb_registers.rev, NUM_REVERB_REGS);
   for (u32 i = 0; i < 2; i++)
-    sw.DoArray(s_state.reverb_downsample_buffer.data(), s_state.reverb_downsample_buffer.size());
+    sw.DoArray(m_reverb_downsample_buffer.data(), m_reverb_downsample_buffer.size());
   for (u32 i = 0; i < 2; i++)
-    sw.DoArray(s_state.reverb_upsample_buffer.data(), s_state.reverb_upsample_buffer.size());
-  sw.Do(&s_state.reverb_resample_buffer_position);
+    sw.DoArray(m_reverb_upsample_buffer.data(), m_reverb_upsample_buffer.size());
+  sw.Do(&m_reverb_resample_buffer_position);
   for (u32 i = 0; i < NUM_VOICES; i++)
   {
-    Voice& v = s_state.voices[i];
+    Voice& v = m_voices[i];
     sw.Do(&v.current_address);
     sw.DoArray(v.regs.index, NUM_VOICE_REGISTERS);
     sw.Do(&v.counter.bits);
     sw.Do(&v.current_block_flags.bits);
-    if constexpr (COMPATIBILITY)
-      sw.DoEx(&v.is_first_block, 47, false);
-    else
-      sw.Do(&v.is_first_block);
+    sw.DoEx(&v.is_first_block, 47, false);
     sw.DoArray(&v.current_block_samples[NUM_SAMPLES_FROM_LAST_ADPCM_BLOCK], NUM_SAMPLES_PER_ADPCM_BLOCK);
     sw.DoArray(&v.current_block_samples[0], NUM_SAMPLES_FROM_LAST_ADPCM_BLOCK);
     sw.Do(&v.adpcm_last_samples);
     sw.Do(&v.last_volume);
-    do_compatible_volume_sweep(sw, &v.left_volume);
-    do_compatible_volume_sweep(sw, &v.right_volume);
-    do_compatible_volume_envelope(sw, &v.adsr_envelope);
+    sw.DoPOD(&v.left_volume);
+    sw.DoPOD(&v.right_volume);
+    sw.DoPOD(&v.adsr_envelope);
     sw.Do(&v.adsr_phase);
     sw.Do(&v.adsr_target);
     sw.Do(&v.has_samples);
     sw.Do(&v.ignore_loop_address);
   }
 
-  sw.Do(&s_state.transfer_fifo);
-  sw.DoBytes(s_ram.data(), RAM_SIZE);
+  sw.Do(&m_transfer_fifo);
+  sw.DoBytes(m_ram.data(), RAM_SIZE);
 
   if (sw.IsReading())
   {
@@ -726,113 +181,105 @@ bool SPU::DoCompatibleState(StateWrapper& sw)
   return !sw.HasError();
 }
 
-bool SPU::DoState(StateWrapper& sw)
-{
-  if (sw.GetVersion() < 70) [[unlikely]]
-    return DoCompatibleState<true>(sw);
-  else
-    return DoCompatibleState<false>(sw);
-}
-
 u16 SPU::ReadRegister(u32 offset)
 {
   switch (offset)
   {
     case 0x1F801D80 - SPU_BASE:
-      return s_state.main_volume_left_reg.bits;
+      return m_main_volume_left_reg.bits;
 
     case 0x1F801D82 - SPU_BASE:
-      return s_state.main_volume_right_reg.bits;
+      return m_main_volume_right_reg.bits;
 
     case 0x1F801D84 - SPU_BASE:
-      return s_state.reverb_registers.vLOUT;
+      return m_reverb_registers.vLOUT;
 
     case 0x1F801D86 - SPU_BASE:
-      return s_state.reverb_registers.vROUT;
+      return m_reverb_registers.vROUT;
 
     case 0x1F801D88 - SPU_BASE:
-      return Truncate16(s_state.key_on_register);
+      return Truncate16(m_key_on_register);
 
     case 0x1F801D8A - SPU_BASE:
-      return Truncate16(s_state.key_on_register >> 16);
+      return Truncate16(m_key_on_register >> 16);
 
     case 0x1F801D8C - SPU_BASE:
-      return Truncate16(s_state.key_off_register);
+      return Truncate16(m_key_off_register);
 
     case 0x1F801D8E - SPU_BASE:
-      return Truncate16(s_state.key_off_register >> 16);
+      return Truncate16(m_key_off_register >> 16);
 
     case 0x1F801D90 - SPU_BASE:
-      return Truncate16(s_state.pitch_modulation_enable_register);
+      return Truncate16(m_pitch_modulation_enable_register);
 
     case 0x1F801D92 - SPU_BASE:
-      return Truncate16(s_state.pitch_modulation_enable_register >> 16);
+      return Truncate16(m_pitch_modulation_enable_register >> 16);
 
     case 0x1F801D94 - SPU_BASE:
-      return Truncate16(s_state.noise_mode_register);
+      return Truncate16(m_noise_mode_register);
 
     case 0x1F801D96 - SPU_BASE:
-      return Truncate16(s_state.noise_mode_register >> 16);
+      return Truncate16(m_noise_mode_register >> 16);
 
     case 0x1F801D98 - SPU_BASE:
-      return Truncate16(s_state.reverb_on_register);
+      return Truncate16(m_reverb_on_register);
 
     case 0x1F801D9A - SPU_BASE:
-      return Truncate16(s_state.reverb_on_register >> 16);
+      return Truncate16(m_reverb_on_register >> 16);
 
     case 0x1F801D9C - SPU_BASE:
-      return Truncate16(s_state.endx_register);
+      return Truncate16(m_endx_register);
 
     case 0x1F801D9E - SPU_BASE:
-      return Truncate16(s_state.endx_register >> 16);
+      return Truncate16(m_endx_register >> 16);
 
     case 0x1F801DA2 - SPU_BASE:
-      return s_state.reverb_registers.mBASE;
+      return m_reverb_registers.mBASE;
 
     case 0x1F801DA4 - SPU_BASE:
-      TRACE_LOG("SPU IRQ address -> 0x{:04X}", s_state.irq_address);
-      return s_state.irq_address;
+      Log_TracePrintf("SPU IRQ address -> 0x%04X", ZeroExtend32(m_irq_address));
+      return m_irq_address;
 
     case 0x1F801DA6 - SPU_BASE:
-      TRACE_LOG("SPU transfer address register -> 0x{:04X}", s_state.transfer_address_reg);
-      return s_state.transfer_address_reg;
+      Log_TracePrintf("SPU transfer address register -> 0x%04X", ZeroExtend32(m_transfer_address_reg));
+      return m_transfer_address_reg;
 
     case 0x1F801DA8 - SPU_BASE:
-      TRACE_LOG("SPU transfer data register read");
+      Log_TracePrintf("SPU transfer data register read");
       return UINT16_C(0xFFFF);
 
     case 0x1F801DAA - SPU_BASE:
-      TRACE_LOG("SPU control register -> 0x{:04X}", s_state.SPUCNT.bits);
-      return s_state.SPUCNT.bits;
+      Log_TracePrintf("SPU control register -> 0x%04X", ZeroExtend32(m_SPUCNT.bits));
+      return m_SPUCNT.bits;
 
     case 0x1F801DAC - SPU_BASE:
-      TRACE_LOG("SPU transfer control register -> 0x{:04X}", s_state.transfer_control.bits);
-      return s_state.transfer_control.bits;
+      Log_TracePrintf("SPU transfer control register -> 0x%04X", ZeroExtend32(m_transfer_control.bits));
+      return m_transfer_control.bits;
 
     case 0x1F801DAE - SPU_BASE:
       GeneratePendingSamples();
-      TRACE_LOG("SPU status register -> 0x{:04X}", s_state.SPUCNT.bits);
-      return s_state.SPUSTAT.bits;
+      Log_TracePrintf("SPU status register -> 0x%04X", ZeroExtend32(m_SPUCNT.bits));
+      return m_SPUSTAT.bits;
 
     case 0x1F801DB0 - SPU_BASE:
-      return s_state.cd_audio_volume_left;
+      return m_cd_audio_volume_left;
 
     case 0x1F801DB2 - SPU_BASE:
-      return s_state.cd_audio_volume_right;
+      return m_cd_audio_volume_right;
 
     case 0x1F801DB4 - SPU_BASE:
-      return s_state.external_volume_left;
+      return m_external_volume_left;
 
     case 0x1F801DB6 - SPU_BASE:
-      return s_state.external_volume_right;
+      return m_external_volume_right;
 
     case 0x1F801DB8 - SPU_BASE:
       GeneratePendingSamples();
-      return s_state.main_volume_left.current_level;
+      return m_main_volume_left.current_level;
 
     case 0x1F801DBA - SPU_BASE:
       GeneratePendingSamples();
-      return s_state.main_volume_right.current_level;
+      return m_main_volume_right.current_level;
 
     default:
     {
@@ -840,19 +287,19 @@ u16 SPU::ReadRegister(u32 offset)
         return ReadVoiceRegister(offset);
 
       if (offset >= (0x1F801DC0 - SPU_BASE) && offset < (0x1F801E00 - SPU_BASE))
-        return s_state.reverb_registers.rev[(offset - (0x1F801DC0 - SPU_BASE)) / 2];
+        return m_reverb_registers.rev[(offset - (0x1F801DC0 - SPU_BASE)) / 2];
 
       if (offset >= (0x1F801E00 - SPU_BASE) && offset < (0x1F801E60 - SPU_BASE))
       {
         const u32 voice_index = (offset - (0x1F801E00 - SPU_BASE)) / 4;
         GeneratePendingSamples();
         if (offset & 0x02)
-          return s_state.voices[voice_index].left_volume.current_level;
+          return m_voices[voice_index].left_volume.current_level;
         else
-          return s_state.voices[voice_index].right_volume.current_level;
+          return m_voices[voice_index].right_volume.current_level;
       }
 
-      DEV_LOG("Unknown SPU register read: offset 0x{:X} (address 0x{:08X})", offset, offset | SPU_BASE);
+      Log_ErrorPrintf("Unknown SPU register read: offset 0x%X (address 0x%08X)", offset, offset | SPU_BASE);
       return UINT16_C(0xFFFF);
     }
   }
@@ -864,135 +311,134 @@ void SPU::WriteRegister(u32 offset, u16 value)
   {
     case 0x1F801D80 - SPU_BASE:
     {
-      DEBUG_LOG("SPU main volume left <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU main volume left <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.main_volume_left_reg.bits = value;
-      s_state.main_volume_left.Reset(s_state.main_volume_left_reg);
+      m_main_volume_left_reg.bits = value;
+      m_main_volume_left.Reset(m_main_volume_left_reg);
       return;
     }
 
     case 0x1F801D82 - SPU_BASE:
     {
-      DEBUG_LOG("SPU main volume right <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU main volume right <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.main_volume_right_reg.bits = value;
-      s_state.main_volume_right.Reset(s_state.main_volume_right_reg);
+      m_main_volume_right_reg.bits = value;
+      m_main_volume_right.Reset(m_main_volume_right_reg);
       return;
     }
 
     case 0x1F801D84 - SPU_BASE:
     {
-      DEBUG_LOG("SPU reverb output volume left <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU reverb output volume left <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.reverb_registers.vLOUT = value;
+      m_reverb_registers.vLOUT = value;
       return;
     }
 
     case 0x1F801D86 - SPU_BASE:
     {
-      DEBUG_LOG("SPU reverb output volume right <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU reverb output volume right <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.reverb_registers.vROUT = value;
+      m_reverb_registers.vROUT = value;
       return;
     }
 
     case 0x1F801D88 - SPU_BASE:
     {
-      DEBUG_LOG("SPU key on low <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU key on low <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.key_on_register = (s_state.key_on_register & 0xFFFF0000) | ZeroExtend32(value);
+      m_key_on_register = (m_key_on_register & 0xFFFF0000) | ZeroExtend32(value);
     }
     break;
 
     case 0x1F801D8A - SPU_BASE:
     {
-      DEBUG_LOG("SPU key on high <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU key on high <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.key_on_register = (s_state.key_on_register & 0x0000FFFF) | (ZeroExtend32(value) << 16);
+      m_key_on_register = (m_key_on_register & 0x0000FFFF) | (ZeroExtend32(value) << 16);
     }
     break;
 
     case 0x1F801D8C - SPU_BASE:
     {
-      DEBUG_LOG("SPU key off low <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU key off low <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.key_off_register = (s_state.key_off_register & 0xFFFF0000) | ZeroExtend32(value);
+      m_key_off_register = (m_key_off_register & 0xFFFF0000) | ZeroExtend32(value);
     }
     break;
 
     case 0x1F801D8E - SPU_BASE:
     {
-      DEBUG_LOG("SPU key off high <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU key off high <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.key_off_register = (s_state.key_off_register & 0x0000FFFF) | (ZeroExtend32(value) << 16);
+      m_key_off_register = (m_key_off_register & 0x0000FFFF) | (ZeroExtend32(value) << 16);
     }
     break;
 
     case 0x1F801D90 - SPU_BASE:
     {
       GeneratePendingSamples();
-      s_state.pitch_modulation_enable_register =
-        (s_state.pitch_modulation_enable_register & 0xFFFF0000) | ZeroExtend32(value);
-      DEBUG_LOG("SPU pitch modulation enable register <- 0x{:08X}", s_state.pitch_modulation_enable_register);
+      m_pitch_modulation_enable_register = (m_pitch_modulation_enable_register & 0xFFFF0000) | ZeroExtend32(value);
+      Log_DebugPrintf("SPU pitch modulation enable register <- 0x%08X", m_pitch_modulation_enable_register);
     }
     break;
 
     case 0x1F801D92 - SPU_BASE:
     {
       GeneratePendingSamples();
-      s_state.pitch_modulation_enable_register =
-        (s_state.pitch_modulation_enable_register & 0x0000FFFF) | (ZeroExtend32(value) << 16);
-      DEBUG_LOG("SPU pitch modulation enable register <- 0x{:08X}", s_state.pitch_modulation_enable_register);
+      m_pitch_modulation_enable_register =
+        (m_pitch_modulation_enable_register & 0x0000FFFF) | (ZeroExtend32(value) << 16);
+      Log_DebugPrintf("SPU pitch modulation enable register <- 0x%08X", m_pitch_modulation_enable_register);
     }
     break;
 
     case 0x1F801D94 - SPU_BASE:
     {
-      DEBUG_LOG("SPU noise mode register <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU noise mode register <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.noise_mode_register = (s_state.noise_mode_register & 0xFFFF0000) | ZeroExtend32(value);
+      m_noise_mode_register = (m_noise_mode_register & 0xFFFF0000) | ZeroExtend32(value);
     }
     break;
 
     case 0x1F801D96 - SPU_BASE:
     {
-      DEBUG_LOG("SPU noise mode register <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU noise mode register <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.noise_mode_register = (s_state.noise_mode_register & 0x0000FFFF) | (ZeroExtend32(value) << 16);
+      m_noise_mode_register = (m_noise_mode_register & 0x0000FFFF) | (ZeroExtend32(value) << 16);
     }
     break;
 
     case 0x1F801D98 - SPU_BASE:
     {
-      DEBUG_LOG("SPU reverb on register <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU reverb on register <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.reverb_on_register = (s_state.reverb_on_register & 0xFFFF0000) | ZeroExtend32(value);
+      m_reverb_on_register = (m_reverb_on_register & 0xFFFF0000) | ZeroExtend32(value);
     }
     break;
 
     case 0x1F801D9A - SPU_BASE:
     {
-      DEBUG_LOG("SPU reverb on register <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU reverb on register <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.reverb_on_register = (s_state.reverb_on_register & 0x0000FFFF) | (ZeroExtend32(value) << 16);
+      m_reverb_on_register = (m_reverb_on_register & 0x0000FFFF) | (ZeroExtend32(value) << 16);
     }
     break;
 
     case 0x1F801DA2 - SPU_BASE:
     {
-      DEBUG_LOG("SPU reverb base address < 0x{:04X}", value);
+      Log_DebugPrintf("SPU reverb base address < 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.reverb_registers.mBASE = value;
-      s_state.reverb_base_address = ZeroExtend32(value << 2) & 0x3FFFFu;
-      s_state.reverb_current_address = s_state.reverb_base_address;
+      m_reverb_registers.mBASE = value;
+      m_reverb_base_address = ZeroExtend32(value << 2) & 0x3FFFFu;
+      m_reverb_current_address = m_reverb_base_address;
     }
     break;
 
     case 0x1F801DA4 - SPU_BASE:
     {
-      DEBUG_LOG("SPU IRQ address register <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU IRQ address register <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.irq_address = value;
+      m_irq_address = value;
 
       if (IsRAMIRQTriggerable())
         CheckForLateRAMIRQs();
@@ -1002,14 +448,14 @@ void SPU::WriteRegister(u32 offset, u16 value)
 
     case 0x1F801DA6 - SPU_BASE:
     {
-      DEBUG_LOG("SPU transfer address register <- 0x{:04X}", value);
-      s_state.transfer_event.InvokeEarly();
-      s_state.transfer_address_reg = value;
-      s_state.transfer_address = ZeroExtend32(value) * 8;
-      if (IsRAMIRQTriggerable() && CheckRAMIRQ(s_state.transfer_address))
+      Log_DebugPrintf("SPU transfer address register <- 0x%04X", ZeroExtend32(value));
+      m_transfer_event->InvokeEarly();
+      m_transfer_address_reg = value;
+      m_transfer_address = ZeroExtend32(value) * 8;
+      if (IsRAMIRQTriggerable() && CheckRAMIRQ(m_transfer_address))
       {
-        DEBUG_LOG("Trigger IRQ @ {:08X} {:04X} from transfer address reg set", s_state.transfer_address,
-                  s_state.transfer_address / 8);
+        Log_DebugPrintf("Trigger IRQ @ %08X %04X from transfer address reg set", m_transfer_address,
+                        m_transfer_address / 8);
         TriggerRAMIRQ();
       }
       return;
@@ -1017,8 +463,8 @@ void SPU::WriteRegister(u32 offset, u16 value)
 
     case 0x1F801DA8 - SPU_BASE:
     {
-      TRACE_LOG("SPU transfer data register <- 0x{:04X} (RAM offset 0x{:08X})", ZeroExtend32(value),
-                s_state.transfer_address);
+      Log_TracePrintf("SPU transfer data register <- 0x%04X (RAM offset 0x%08X)", ZeroExtend32(value),
+                      m_transfer_address);
 
       ManualTransferWrite(value);
       return;
@@ -1026,53 +472,48 @@ void SPU::WriteRegister(u32 offset, u16 value)
 
     case 0x1F801DAA - SPU_BASE:
     {
-      DEBUG_LOG("SPU control register <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU control register <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
 
-      const SPUCNTRegister new_value{value};
-      if (new_value.ram_transfer_mode != s_state.SPUCNT.ram_transfer_mode &&
+      const SPUCNT new_value{value};
+      if (new_value.ram_transfer_mode != m_SPUCNT.ram_transfer_mode &&
           new_value.ram_transfer_mode == RAMTransferMode::Stopped)
       {
         // clear the fifo here?
-        if (!s_state.transfer_fifo.IsEmpty())
+        if (!m_transfer_fifo.IsEmpty())
         {
-          if (s_state.SPUCNT.ram_transfer_mode == RAMTransferMode::DMAWrite)
+          if (m_SPUCNT.ram_transfer_mode == RAMTransferMode::DMAWrite)
           {
             // I would guess on the console it would gradually write the FIFO out. Hopefully nothing relies on this
             // level of timing granularity if we force it all out here.
-            WARNING_LOG("Draining write SPU transfer FIFO with {} bytes left", s_state.transfer_fifo.GetSize());
+            Log_WarningPrintf("Draining write SPU transfer FIFO with %u bytes left", m_transfer_fifo.GetSize());
             TickCount ticks = std::numeric_limits<TickCount>::max();
             ExecuteFIFOWriteToRAM(ticks);
-            DebugAssert(s_state.transfer_fifo.IsEmpty());
+            DebugAssert(m_transfer_fifo.IsEmpty());
           }
           else
           {
-            DEBUG_LOG("Clearing read SPU transfer FIFO with {} bytes left", s_state.transfer_fifo.GetSize());
-            s_state.transfer_fifo.Clear();
+            Log_DebugPrintf("Clearing read SPU transfer FIFO with %u bytes left", m_transfer_fifo.GetSize());
+            m_transfer_fifo.Clear();
           }
         }
       }
 
-      if (!new_value.enable && s_state.SPUCNT.enable)
+      if (!new_value.enable && m_SPUCNT.enable)
       {
         // Mute all voices.
         // Interestingly, hardware tests found this seems to happen immediately, not on the next 44100hz cycle.
         for (u32 i = 0; i < NUM_VOICES; i++)
-          s_state.voices[i].ForceOff();
+          m_voices[i].ForceOff();
       }
 
-      s_state.SPUCNT.bits = new_value.bits;
-      s_state.SPUSTAT.mode = s_state.SPUCNT.mode.GetValue();
+      m_SPUCNT.bits = new_value.bits;
+      m_SPUSTAT.mode = m_SPUCNT.mode.GetValue();
 
-      if (!s_state.SPUCNT.irq9_enable)
-      {
-        s_state.SPUSTAT.irq9_flag = false;
-        InterruptController::SetLineState(InterruptController::IRQ::SPU, false);
-      }
+      if (!m_SPUCNT.irq9_enable)
+        m_SPUSTAT.irq9_flag = false;
       else if (IsRAMIRQTriggerable())
-      {
         CheckForLateRAMIRQs();
-      }
 
       UpdateEventInterval();
       UpdateDMARequest();
@@ -1082,56 +523,40 @@ void SPU::WriteRegister(u32 offset, u16 value)
 
     case 0x1F801DAC - SPU_BASE:
     {
-      DEBUG_LOG("SPU transfer control register <- 0x{:04X}", value);
-      s_state.transfer_control.bits = value;
+      Log_DebugPrintf("SPU transfer control register <- 0x%04X", ZeroExtend32(value));
+      m_transfer_control.bits = value;
       return;
     }
 
     case 0x1F801DB0 - SPU_BASE:
     {
-      DEBUG_LOG("SPU left cd audio register <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU left cd audio register <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.cd_audio_volume_left = value;
+      m_cd_audio_volume_left = value;
     }
     break;
 
     case 0x1F801DB2 - SPU_BASE:
     {
-      DEBUG_LOG("SPU right cd audio register <- 0x{:04X}", value);
+      Log_DebugPrintf("SPU right cd audio register <- 0x%04X", ZeroExtend32(value));
       GeneratePendingSamples();
-      s_state.cd_audio_volume_right = value;
+      m_cd_audio_volume_right = value;
     }
     break;
 
     case 0x1F801DB4 - SPU_BASE:
     {
       // External volumes aren't used, so don't bother syncing.
-      DEBUG_LOG("SPU left external volume register <- 0x{:04X}", value);
-      s_state.external_volume_left = value;
+      Log_DebugPrintf("SPU left external volume register <- 0x%04X", ZeroExtend32(value));
+      m_external_volume_left = value;
     }
     break;
 
     case 0x1F801DB6 - SPU_BASE:
     {
       // External volumes aren't used, so don't bother syncing.
-      DEBUG_LOG("SPU right external volume register <- 0x{:04X}", value);
-      s_state.external_volume_right = value;
-    }
-    break;
-
-    case 0x1F801DB8 - SPU_BASE:
-    {
-      DEBUG_LOG("SPU main left volume register <- 0x{:04X}", value);
-      GeneratePendingSamples();
-      s_state.main_volume_left.current_level = value;
-    }
-    break;
-
-    case 0x1F801DBA - SPU_BASE:
-    {
-      DEBUG_LOG("SPU main right volume register <- 0x{:04X}", value);
-      GeneratePendingSamples();
-      s_state.main_volume_right.current_level = value;
+      Log_DebugPrintf("SPU right external volume register <- 0x%04X", ZeroExtend32(value));
+      m_external_volume_right = value;
     }
     break;
 
@@ -1152,14 +577,14 @@ void SPU::WriteRegister(u32 offset, u16 value)
       if (offset >= (0x1F801DC0 - SPU_BASE) && offset < (0x1F801E00 - SPU_BASE))
       {
         const u32 reg = (offset - (0x1F801DC0 - SPU_BASE)) / 2;
-        DEBUG_LOG("SPU reverb register {} <- 0x{:04X}", reg, value);
+        Log_DebugPrintf("SPU reverb register %u <- 0x%04X", reg, value);
         GeneratePendingSamples();
-        s_state.reverb_registers.rev[reg] = value;
+        m_reverb_registers.rev[reg] = value;
         return;
       }
 
-      DEV_LOG("Unknown SPU register write: offset 0x{:X} (address 0x{:08X}) value 0x{:04X}", offset, offset | SPU_BASE,
-              value);
+      Log_ErrorPrintf("Unknown SPU register write: offset 0x%X (address 0x%08X) value 0x%04X", offset,
+                      offset | SPU_BASE, ZeroExtend32(value));
       return;
     }
   }
@@ -1172,11 +597,11 @@ u16 SPU::ReadVoiceRegister(u32 offset)
   Assert(voice_index < 24);
 
   // ADSR volume needs to be updated when reading. A voice might be off as well, but key on is pending.
-  const Voice& voice = s_state.voices[voice_index];
-  if (reg_index >= 6 && (voice.IsOn() || s_state.key_on_register & (1u << voice_index)))
+  const Voice& voice = m_voices[voice_index];
+  if (reg_index >= 6 && (voice.IsOn() || m_key_on_register & (1u << voice_index)))
     GeneratePendingSamples();
 
-  TRACE_LOG("Read voice {} register {} -> 0x{:02X}", voice_index, reg_index, voice.regs.index[reg_index]);
+  Log_TracePrintf("Read voice %u register %u -> 0x%02X", voice_index, reg_index, voice.regs.index[reg_index]);
   return voice.regs.index[reg_index];
 }
 
@@ -1187,15 +612,15 @@ void SPU::WriteVoiceRegister(u32 offset, u16 value)
   const u32 voice_index = (offset / 0x10);
   DebugAssert(voice_index < 24);
 
-  Voice& voice = s_state.voices[voice_index];
-  if (voice.IsOn() || s_state.key_on_register & (1u << voice_index))
+  Voice& voice = m_voices[voice_index];
+  if (voice.IsOn() || m_key_on_register & (1u << voice_index))
     GeneratePendingSamples();
 
   switch (reg_index)
   {
     case 0x00: // volume left
     {
-      DEBUG_LOG("SPU voice {} volume left <- 0x{:04X}", voice_index, value);
+      Log_DebugPrintf("SPU voice %u volume left <- 0x%04X", voice_index, value);
       voice.regs.volume_left.bits = value;
       voice.left_volume.Reset(voice.regs.volume_left);
     }
@@ -1203,7 +628,7 @@ void SPU::WriteVoiceRegister(u32 offset, u16 value)
 
     case 0x02: // volume right
     {
-      DEBUG_LOG("SPU voice {} volume right <- 0x{:04X}", voice_index, value);
+      Log_DebugPrintf("SPU voice %u volume right <- 0x%04X", voice_index, value);
       voice.regs.volume_right.bits = value;
       voice.right_volume.Reset(voice.regs.volume_right);
     }
@@ -1211,21 +636,21 @@ void SPU::WriteVoiceRegister(u32 offset, u16 value)
 
     case 0x04: // sample rate
     {
-      DEBUG_LOG("SPU voice {} ADPCM sample rate <- 0x{:04X}", voice_index, value);
+      Log_DebugPrintf("SPU voice %u ADPCM sample rate <- 0x%04X", voice_index, value);
       voice.regs.adpcm_sample_rate = value;
     }
     break;
 
     case 0x06: // start address
     {
-      DEBUG_LOG("SPU voice {} ADPCM start address <- 0x{:04X}", voice_index, value);
+      Log_DebugPrintf("SPU voice %u ADPCM start address <- 0x%04X", voice_index, value);
       voice.regs.adpcm_start_address = value;
     }
     break;
 
     case 0x08: // adsr low
     {
-      DEBUG_LOG("SPU voice {} ADSR low <- 0x{:04X} (was 0x{:04X})", voice_index, value, voice.regs.adsr.bits_low);
+      Log_DebugPrintf("SPU voice %u ADSR low <- 0x%04X (was 0x%04X)", voice_index, value, voice.regs.adsr.bits_low);
       voice.regs.adsr.bits_low = value;
       if (voice.IsOn())
         voice.UpdateADSREnvelope();
@@ -1234,7 +659,7 @@ void SPU::WriteVoiceRegister(u32 offset, u16 value)
 
     case 0x0A: // adsr high
     {
-      DEBUG_LOG("SPU voice {} ADSR high <- 0x{:04X} (was 0x{:04X})", voice_index, value, voice.regs.adsr.bits_low);
+      Log_DebugPrintf("SPU voice %u ADSR high <- 0x%04X (was 0x%04X)", voice_index, value, voice.regs.adsr.bits_low);
       voice.regs.adsr.bits_high = value;
       if (voice.IsOn())
         voice.UpdateADSREnvelope();
@@ -1243,7 +668,7 @@ void SPU::WriteVoiceRegister(u32 offset, u16 value)
 
     case 0x0C: // adsr volume
     {
-      DEBUG_LOG("SPU voice {} ADSR volume <- 0x{:04X} (was 0x{:04X})", voice_index, value, voice.regs.adsr_volume);
+      Log_DebugPrintf("SPU voice %u ADSR volume <- 0x%04X (was 0x%04X)", voice_index, value, voice.regs.adsr_volume);
       voice.regs.adsr_volume = value;
     }
     break;
@@ -1251,80 +676,45 @@ void SPU::WriteVoiceRegister(u32 offset, u16 value)
     case 0x0E: // repeat address
     {
       // There is a short window of time here between the voice being keyed on and the first block finishing decoding
-      // where setting the repeat address will *NOT* ignore the block/loop start flag.
-      //
-      // We always set this flag if the voice is off, because IRQs will keep the voice reading regardless, and we don't
-      // want the address that we just set to get wiped out by the IRQ looping.
-      //
-      // Games sensitive to this are:
+      // where setting the repeat address will *NOT* ignore the block/loop start flag. Games sensitive to this are:
       //  - The Misadventures of Tron Bonne
-      //  - Re-Loaded - The Hardcore Sequel (repeated sound effects)
+      //  - Re-Loaded - The Hardcore Sequel
       //  - Valkyrie Profile
 
-      const bool ignore_loop_address = !voice.IsOn() || !voice.is_first_block;
-      DEBUG_LOG("SPU voice {} ADPCM repeat address <- 0x{:04X}", voice_index, value);
+      const bool ignore_loop_address = voice.IsOn() && !voice.is_first_block;
+      Log_DebugPrintf("SPU voice %u ADPCM repeat address <- 0x%04X", voice_index, value);
       voice.regs.adpcm_repeat_address = value;
       voice.ignore_loop_address |= ignore_loop_address;
 
       if (!ignore_loop_address)
       {
-        DEV_LOG("Not ignoring loop address, the ADPCM repeat address of 0x{:04X} for voice {} will be overwritten",
-                value, voice_index);
+        Log_DevPrintf("Not ignoring loop address, the ADPCM repeat address of 0x%04X for voice %u will be overwritten",
+                      value, voice_index);
       }
     }
     break;
 
     default:
     {
-      ERROR_LOG("Unknown SPU voice {} register write: offset 0x%X (address 0x{:08X}) value 0x{:04X}", offset,
-                voice_index, offset | SPU_BASE, ZeroExtend32(value));
+      Log_ErrorPrintf("Unknown SPU voice %u register write: offset 0x%X (address 0x%08X) value 0x%04X", offset,
+                      voice_index, offset | SPU_BASE, ZeroExtend32(value));
     }
     break;
   }
 }
 
-bool SPU::IsVoiceReverbEnabled(u32 i)
-{
-  return ConvertToBoolUnchecked((s_state.reverb_on_register >> i) & u32(1));
-}
-
-bool SPU::IsVoiceNoiseEnabled(u32 i)
-{
-  return ConvertToBoolUnchecked((s_state.noise_mode_register >> i) & u32(1));
-}
-
-bool SPU::IsPitchModulationEnabled(u32 i)
-{
-  return ((i > 0) && ConvertToBoolUnchecked((s_state.pitch_modulation_enable_register >> i) & u32(1)));
-}
-
-s16 SPU::GetVoiceNoiseLevel()
-{
-  return static_cast<s16>(static_cast<u16>(s_state.noise_level));
-}
-
-bool SPU::IsRAMIRQTriggerable()
-{
-  return s_state.SPUCNT.irq9_enable && !s_state.SPUSTAT.irq9_flag;
-}
-
-bool SPU::CheckRAMIRQ(u32 address)
-{
-  return ((ZeroExtend32(s_state.irq_address) * 8) == address);
-}
-
 void SPU::TriggerRAMIRQ()
 {
   DebugAssert(IsRAMIRQTriggerable());
-  s_state.SPUSTAT.irq9_flag = true;
-  InterruptController::SetLineState(InterruptController::IRQ::SPU, true);
+  m_SPUSTAT.irq9_flag = true;
+  g_interrupt_controller.InterruptRequest(InterruptController::IRQ::SPU);
 }
 
 void SPU::CheckForLateRAMIRQs()
 {
-  if (CheckRAMIRQ(s_state.transfer_address))
+  if (CheckRAMIRQ(m_transfer_address))
   {
-    DEBUG_LOG("Trigger IRQ @ {:08X} {:04X} from late transfer", s_state.transfer_address, s_state.transfer_address / 8);
+    Log_DebugPrintf("Trigger IRQ @ %08X %04X from late transfer", m_transfer_address, m_transfer_address / 8);
     TriggerRAMIRQ();
     return;
   }
@@ -1333,14 +723,14 @@ void SPU::CheckForLateRAMIRQs()
   {
     // we skip voices which haven't started this block yet - because they'll check
     // the next time they're sampled, and the delay might be important.
-    const Voice& v = s_state.voices[i];
+    const Voice& v = m_voices[i];
     if (!v.has_samples)
       continue;
 
     const u32 address = v.current_address * 8;
     if (CheckRAMIRQ(address) || CheckRAMIRQ((address + 8) & RAM_MASK))
     {
-      DEBUG_LOG("Trigger IRQ @ {:08X} ({:04X}) from late", address, address / 8);
+      Log_DebugPrintf("Trigger IRQ @ %08X %04X from late", address, address / 8);
       TriggerRAMIRQ();
       return;
     }
@@ -1349,69 +739,66 @@ void SPU::CheckForLateRAMIRQs()
 
 void SPU::WriteToCaptureBuffer(u32 index, s16 value)
 {
-  const u32 ram_address = (index * CAPTURE_BUFFER_SIZE_PER_CHANNEL) | ZeroExtend16(s_state.capture_buffer_position);
-  // Log_DebugFmt("write to capture buffer {} (0x{:08X}) <- 0x{:04X}", index, ram_address, u16(value));
-  std::memcpy(&s_ram[ram_address], &value, sizeof(value));
+  const u32 ram_address = (index * CAPTURE_BUFFER_SIZE_PER_CHANNEL) | ZeroExtend16(m_capture_buffer_position);
+  // Log_DebugPrintf("write to capture buffer %u (0x%08X) <- 0x%04X", index, ram_address, u16(value));
+  std::memcpy(&m_ram[ram_address], &value, sizeof(value));
   if (IsRAMIRQTriggerable() && CheckRAMIRQ(ram_address))
   {
-    DEBUG_LOG("Trigger IRQ @ {:08X} ({:04X}) from capture buffer", ram_address, ram_address / 8);
+    Log_DebugPrintf("Trigger IRQ @ %08X %04X from capture buffer", ram_address, ram_address / 8);
     TriggerRAMIRQ();
   }
 }
 
 void SPU::IncrementCaptureBufferPosition()
 {
-  s_state.capture_buffer_position += sizeof(s16);
-  s_state.capture_buffer_position %= CAPTURE_BUFFER_SIZE_PER_CHANNEL;
-  s_state.SPUSTAT.second_half_capture_buffer = s_state.capture_buffer_position >= (CAPTURE_BUFFER_SIZE_PER_CHANNEL / 2);
+  m_capture_buffer_position += sizeof(s16);
+  m_capture_buffer_position %= CAPTURE_BUFFER_SIZE_PER_CHANNEL;
+  m_SPUSTAT.second_half_capture_buffer = m_capture_buffer_position >= (CAPTURE_BUFFER_SIZE_PER_CHANNEL / 2);
 }
 
-ALWAYS_INLINE_RELEASE void SPU::ExecuteFIFOReadFromRAM(TickCount& ticks)
+void ALWAYS_INLINE SPU::ExecuteFIFOReadFromRAM(TickCount& ticks)
 {
-  while (ticks > 0 && !s_state.transfer_fifo.IsFull())
+  while (ticks > 0 && !m_transfer_fifo.IsFull())
   {
     u16 value;
-    std::memcpy(&value, &s_ram[s_state.transfer_address], sizeof(u16));
-    s_state.transfer_address = (s_state.transfer_address + sizeof(u16)) & RAM_MASK;
-    s_state.transfer_fifo.Push(value);
+    std::memcpy(&value, &m_ram[m_transfer_address], sizeof(u16));
+    m_transfer_address = (m_transfer_address + sizeof(u16)) & RAM_MASK;
+    m_transfer_fifo.Push(value);
     ticks -= TRANSFER_TICKS_PER_HALFWORD;
 
-    if (IsRAMIRQTriggerable() && CheckRAMIRQ(s_state.transfer_address))
+    if (IsRAMIRQTriggerable() && CheckRAMIRQ(m_transfer_address))
     {
-      DEBUG_LOG("Trigger IRQ @ {:08X} ({:04X}) from transfer read", s_state.transfer_address,
-                s_state.transfer_address / 8);
+      Log_DebugPrintf("Trigger IRQ @ %08X %04X from transfer read", m_transfer_address, m_transfer_address / 8);
       TriggerRAMIRQ();
     }
   }
 }
 
-ALWAYS_INLINE_RELEASE void SPU::ExecuteFIFOWriteToRAM(TickCount& ticks)
+void ALWAYS_INLINE SPU::ExecuteFIFOWriteToRAM(TickCount& ticks)
 {
-  while (ticks > 0 && !s_state.transfer_fifo.IsEmpty())
+  while (ticks > 0 && !m_transfer_fifo.IsEmpty())
   {
-    u16 value = s_state.transfer_fifo.Pop();
-    std::memcpy(&s_ram[s_state.transfer_address], &value, sizeof(u16));
-    s_state.transfer_address = (s_state.transfer_address + sizeof(u16)) & RAM_MASK;
+    u16 value = m_transfer_fifo.Pop();
+    std::memcpy(&m_ram[m_transfer_address], &value, sizeof(u16));
+    m_transfer_address = (m_transfer_address + sizeof(u16)) & RAM_MASK;
     ticks -= TRANSFER_TICKS_PER_HALFWORD;
 
-    if (IsRAMIRQTriggerable() && CheckRAMIRQ(s_state.transfer_address))
+    if (IsRAMIRQTriggerable() && CheckRAMIRQ(m_transfer_address))
     {
-      DEBUG_LOG("Trigger IRQ @ {:08X} ({:04X}) from transfer write", s_state.transfer_address,
-                s_state.transfer_address / 8);
+      Log_DebugPrintf("Trigger IRQ @ %08X %04X from transfer write", m_transfer_address, m_transfer_address / 8);
       TriggerRAMIRQ();
     }
   }
 }
 
-void SPU::ExecuteTransfer(void* param, TickCount ticks, TickCount ticks_late)
+void SPU::ExecuteTransfer(TickCount ticks)
 {
-  const RAMTransferMode mode = s_state.SPUCNT.ram_transfer_mode;
-  DebugAssert(mode != RAMTransferMode::Stopped);
-  InternalGeneratePendingSamples();
+  const RAMTransferMode mode = m_SPUCNT.ram_transfer_mode;
+  Assert(mode != RAMTransferMode::Stopped);
 
   if (mode == RAMTransferMode::DMARead)
   {
-    while (ticks > 0 && !s_state.transfer_fifo.IsFull())
+    while (ticks > 0 && !m_transfer_fifo.IsFull())
     {
       ExecuteFIFOReadFromRAM(ticks);
 
@@ -1420,22 +807,22 @@ void SPU::ExecuteTransfer(void* param, TickCount ticks, TickCount ticks_late)
     }
 
     // we're done if we have no more data to read
-    if (s_state.transfer_fifo.IsFull())
+    if (m_transfer_fifo.IsFull())
     {
-      s_state.SPUSTAT.transfer_busy = false;
-      s_state.transfer_event.Deactivate();
+      m_SPUSTAT.transfer_busy = false;
+      m_transfer_event->Deactivate();
       return;
     }
 
-    s_state.SPUSTAT.transfer_busy = true;
+    m_SPUSTAT.transfer_busy = true;
     const TickCount ticks_until_complete =
-      TickCount(s_state.transfer_fifo.GetSpace() * u32(TRANSFER_TICKS_PER_HALFWORD)) + ((ticks < 0) ? -ticks : 0);
-    s_state.transfer_event.Schedule(ticks_until_complete);
+      TickCount(m_transfer_fifo.GetSpace() * u32(TRANSFER_TICKS_PER_HALFWORD)) + ((ticks < 0) ? -ticks : 0);
+    m_transfer_event->Schedule(ticks_until_complete);
   }
   else
   {
     // write the fifo to ram, request dma again when empty
-    while (ticks > 0 && !s_state.transfer_fifo.IsEmpty())
+    while (ticks > 0 && !m_transfer_fifo.IsEmpty())
     {
       ExecuteFIFOWriteToRAM(ticks);
 
@@ -1444,94 +831,86 @@ void SPU::ExecuteTransfer(void* param, TickCount ticks, TickCount ticks_late)
     }
 
     // we're done if we have no more data to write
-    if (s_state.transfer_fifo.IsEmpty())
+    if (m_transfer_fifo.IsEmpty())
     {
-      s_state.SPUSTAT.transfer_busy = false;
-      s_state.transfer_event.Deactivate();
+      m_SPUSTAT.transfer_busy = false;
+      m_transfer_event->Deactivate();
       return;
     }
 
-    s_state.SPUSTAT.transfer_busy = true;
+    m_SPUSTAT.transfer_busy = true;
     const TickCount ticks_until_complete =
-      TickCount(s_state.transfer_fifo.GetSize() * u32(TRANSFER_TICKS_PER_HALFWORD)) + ((ticks < 0) ? -ticks : 0);
-    s_state.transfer_event.Schedule(ticks_until_complete);
+      TickCount(m_transfer_fifo.GetSize() * u32(TRANSFER_TICKS_PER_HALFWORD)) + ((ticks < 0) ? -ticks : 0);
+    m_transfer_event->Schedule(ticks_until_complete);
   }
 }
 
 void SPU::ManualTransferWrite(u16 value)
 {
-  if (!s_state.transfer_fifo.IsEmpty() && s_state.SPUCNT.ram_transfer_mode != RAMTransferMode::DMARead)
+  if (m_transfer_fifo.IsFull())
   {
-    WARNING_LOG("FIFO not empty on manual SPU write, draining to hopefully avoid corruption. Game is silly.");
-    if (s_state.SPUCNT.ram_transfer_mode != RAMTransferMode::Stopped)
-      ExecuteTransfer(nullptr, std::numeric_limits<s32>::max(), 0);
+    Log_WarningPrintf("FIFO full, dropping write of 0x%04X", value);
+    return;
   }
 
-  std::memcpy(&s_ram[s_state.transfer_address], &value, sizeof(u16));
-  s_state.transfer_address = (s_state.transfer_address + sizeof(u16)) & RAM_MASK;
-
-  if (IsRAMIRQTriggerable() && CheckRAMIRQ(s_state.transfer_address))
-  {
-    DEBUG_LOG("Trigger IRQ @ {:08X} ({:04X}) from manual write", s_state.transfer_address,
-              s_state.transfer_address / 8);
-    TriggerRAMIRQ();
-  }
+  m_transfer_fifo.Push(value);
+  UpdateTransferEvent();
 }
 
 void SPU::UpdateTransferEvent()
 {
-  const RAMTransferMode mode = s_state.SPUCNT.ram_transfer_mode;
+  const RAMTransferMode mode = m_SPUCNT.ram_transfer_mode;
   if (mode == RAMTransferMode::Stopped)
   {
-    s_state.transfer_event.Deactivate();
+    m_transfer_event->Deactivate();
   }
   else if (mode == RAMTransferMode::DMARead)
   {
     // transfer event fills the fifo
-    if (s_state.transfer_fifo.IsFull())
-      s_state.transfer_event.Deactivate();
-    else if (!s_state.transfer_event.IsActive())
-      s_state.transfer_event.Schedule(TickCount(s_state.transfer_fifo.GetSpace() * u32(TRANSFER_TICKS_PER_HALFWORD)));
+    if (m_transfer_fifo.IsFull())
+      m_transfer_event->Deactivate();
+    else if (!m_transfer_event->IsActive())
+      m_transfer_event->Schedule(TickCount(m_transfer_fifo.GetSpace() * u32(TRANSFER_TICKS_PER_HALFWORD)));
   }
   else
   {
     // transfer event copies from fifo to ram
-    if (s_state.transfer_fifo.IsEmpty())
-      s_state.transfer_event.Deactivate();
-    else if (!s_state.transfer_event.IsActive())
-      s_state.transfer_event.Schedule(TickCount(s_state.transfer_fifo.GetSize() * u32(TRANSFER_TICKS_PER_HALFWORD)));
+    if (m_transfer_fifo.IsEmpty())
+      m_transfer_event->Deactivate();
+    else if (!m_transfer_event->IsActive())
+      m_transfer_event->Schedule(TickCount(m_transfer_fifo.GetSize() * u32(TRANSFER_TICKS_PER_HALFWORD)));
   }
 
-  s_state.SPUSTAT.transfer_busy = s_state.transfer_event.IsActive();
+  m_SPUSTAT.transfer_busy = m_transfer_event->IsActive();
 }
 
 void SPU::UpdateDMARequest()
 {
-  switch (s_state.SPUCNT.ram_transfer_mode)
+  switch (m_SPUCNT.ram_transfer_mode)
   {
     case RAMTransferMode::DMARead:
-      s_state.SPUSTAT.dma_read_request = s_state.transfer_fifo.IsFull();
-      s_state.SPUSTAT.dma_write_request = false;
-      s_state.SPUSTAT.dma_request = s_state.SPUSTAT.dma_read_request;
+      m_SPUSTAT.dma_read_request = m_transfer_fifo.IsFull();
+      m_SPUSTAT.dma_write_request = false;
+      m_SPUSTAT.dma_request = m_SPUSTAT.dma_read_request;
       break;
 
     case RAMTransferMode::DMAWrite:
-      s_state.SPUSTAT.dma_read_request = false;
-      s_state.SPUSTAT.dma_write_request = s_state.transfer_fifo.IsEmpty();
-      s_state.SPUSTAT.dma_request = s_state.SPUSTAT.dma_write_request;
+      m_SPUSTAT.dma_read_request = false;
+      m_SPUSTAT.dma_write_request = m_transfer_fifo.IsEmpty();
+      m_SPUSTAT.dma_request = m_SPUSTAT.dma_write_request;
       break;
 
     case RAMTransferMode::Stopped:
     case RAMTransferMode::ManualWrite:
     default:
-      s_state.SPUSTAT.dma_read_request = false;
-      s_state.SPUSTAT.dma_write_request = false;
-      s_state.SPUSTAT.dma_request = false;
+      m_SPUSTAT.dma_read_request = false;
+      m_SPUSTAT.dma_write_request = false;
+      m_SPUSTAT.dma_request = false;
       break;
   }
 
   // This might call us back directly.
-  DMA::SetRequest(DMA::Channel::SPU, s_state.SPUSTAT.dma_request);
+  g_dma.SetRequest(DMA::Channel::SPU, m_SPUSTAT.dma_request);
 }
 
 void SPU::DMARead(u32* words, u32 word_count)
@@ -1581,22 +960,22 @@ void SPU::DMARead(u32* words, u32 word_count)
   u16* halfwords = reinterpret_cast<u16*>(words);
   u32 halfword_count = word_count * 2;
 
-  const u32 size = s_state.transfer_fifo.GetSize();
+  const u32 size = m_transfer_fifo.GetSize();
   if (word_count > size)
   {
     u16 fill_value = 0;
     if (size > 0)
     {
-      s_state.transfer_fifo.PopRange(halfwords, size);
+      m_transfer_fifo.PopRange(halfwords, size);
       fill_value = halfwords[size - 1];
     }
 
-    WARNING_LOG("Transfer FIFO underflow, filling with 0x{:04X}", fill_value);
+    Log_WarningPrintf("Transfer FIFO underflow, filling with 0x%04X", fill_value);
     std::fill_n(&halfwords[size], halfword_count - size, fill_value);
   }
   else
   {
-    s_state.transfer_fifo.PopRange(halfwords, halfword_count);
+    m_transfer_fifo.PopRange(halfwords, halfword_count);
   }
 
   UpdateDMARequest();
@@ -1608,11 +987,11 @@ void SPU::DMAWrite(const u32* words, u32 word_count)
   const u16* halfwords = reinterpret_cast<const u16*>(words);
   u32 halfword_count = word_count * 2;
 
-  const u32 words_to_transfer = std::min(s_state.transfer_fifo.GetSpace(), halfword_count);
-  s_state.transfer_fifo.PushRange(halfwords, words_to_transfer);
+  const u32 words_to_transfer = std::min(m_transfer_fifo.GetSpace(), halfword_count);
+  m_transfer_fifo.PushRange(halfwords, words_to_transfer);
 
-  if (words_to_transfer != halfword_count) [[unlikely]]
-    WARNING_LOG("Transfer FIFO overflow, dropping {} halfwords", halfword_count - words_to_transfer);
+  if (words_to_transfer != halfword_count)
+    Log_WarningPrintf("Transfer FIFO overflow, dropping %u halfwords", halfword_count - words_to_transfer);
 
   UpdateDMARequest();
   UpdateTransferEvent();
@@ -1620,54 +999,49 @@ void SPU::DMAWrite(const u32* words, u32 word_count)
 
 void SPU::GeneratePendingSamples()
 {
-  if (s_state.transfer_event.IsActive())
-    s_state.transfer_event.InvokeEarly();
+  if (m_transfer_event->IsActive())
+    m_transfer_event->InvokeEarly();
 
-  InternalGeneratePendingSamples();
-}
-
-void SPU::InternalGeneratePendingSamples()
-{
-  const TickCount ticks_pending = s_state.tick_event.GetTicksSinceLastExecution();
+  const TickCount ticks_pending = m_tick_event->GetTicksSinceLastExecution();
   TickCount frames_to_execute;
   if (g_settings.cpu_overclock_active)
   {
     frames_to_execute = static_cast<u32>((static_cast<u64>(ticks_pending) * g_settings.cpu_overclock_denominator) +
-                                         static_cast<u32>(s_state.ticks_carry)) /
-                        static_cast<u32>(s_state.cpu_tick_divider);
+                                         static_cast<u32>(m_ticks_carry)) /
+                        static_cast<u32>(m_cpu_tick_divider);
   }
   else
   {
-    frames_to_execute = (ticks_pending + s_state.ticks_carry) / SYSCLK_TICKS_PER_SPU_TICK;
+    frames_to_execute = (m_tick_event->GetTicksSinceLastExecution() + m_ticks_carry) / SYSCLK_TICKS_PER_SPU_TICK;
   }
 
   const bool force_exec = (frames_to_execute > 0);
-  s_state.tick_event.InvokeEarly(force_exec);
+  m_tick_event->InvokeEarly(force_exec);
 }
 
-const std::array<u8, SPU::RAM_SIZE>& SPU::GetRAM()
+bool SPU::StartDumpingAudio(const char* filename)
 {
-  return s_ram;
+  if (m_dump_writer)
+    m_dump_writer.reset();
+
+  m_dump_writer = std::make_unique<Common::WAVWriter>();
+  if (!m_dump_writer->Open(filename, SAMPLE_RATE, 2))
+  {
+    Log_ErrorPrintf("Failed to open '%s'", filename);
+    m_dump_writer.reset();
+    return false;
+  }
+
+  return true;
 }
 
-std::array<u8, SPU::RAM_SIZE>& SPU::GetWritableRAM()
+bool SPU::StopDumpingAudio()
 {
-  return s_ram;
-}
+  if (!m_dump_writer)
+    return false;
 
-bool SPU::IsAudioOutputMuted()
-{
-  return s_state.audio_output_muted;
-}
-
-void SPU::SetAudioOutputMuted(bool muted)
-{
-  s_state.audio_output_muted = muted;
-}
-
-CoreAudioStream& SPU::GetOutputStream()
-{
-  return s_state.audio_stream;
+  m_dump_writer.reset();
+  return true;
 }
 
 void SPU::Voice::KeyOn()
@@ -1729,45 +1103,70 @@ SPU::ADSRPhase SPU::GetNextADSRPhase(ADSRPhase phase)
   }
 }
 
-void SPU::VolumeEnvelope::Reset(u8 rate_, u8 rate_mask_, bool decreasing_, bool exponential_, bool phase_invert_)
+struct ADSRTableEntry
+{
+  s32 ticks;
+  s32 step;
+};
+enum : u32
+{
+  NUM_ADSR_TABLE_ENTRIES = 128,
+  NUM_ADSR_DIRECTIONS = 2 // increasing, decreasing
+};
+using ADSRTableEntries = std::array<std::array<ADSRTableEntry, NUM_ADSR_TABLE_ENTRIES>, NUM_ADSR_DIRECTIONS>;
+
+static constexpr ADSRTableEntries ComputeADSRTableEntries()
+{
+  ADSRTableEntries entries = {};
+  for (u32 decreasing = 0; decreasing < 2; decreasing++)
+  {
+    for (u32 rate = 0; rate < NUM_ADSR_TABLE_ENTRIES; rate++)
+    {
+      if (rate < 48)
+      {
+        entries[decreasing][rate].ticks = 1;
+        if (decreasing != 0)
+          entries[decreasing][rate].step =
+            static_cast<s32>(static_cast<u32>(-8 + static_cast<s32>(rate & 3)) << (11 - (rate >> 2)));
+        else
+          entries[decreasing][rate].step = (7 - static_cast<s32>(rate & 3)) << (11 - (rate >> 2));
+      }
+      else
+      {
+        entries[decreasing][rate].ticks = 1 << (static_cast<s32>(rate >> 2) - 11);
+        if (decreasing != 0)
+          entries[decreasing][rate].step = (-8 + static_cast<s32>(rate & 3));
+        else
+          entries[decreasing][rate].step = (7 - static_cast<s32>(rate & 3));
+      }
+    }
+  }
+
+  return entries;
+}
+
+static constexpr ADSRTableEntries s_adsr_table = ComputeADSRTableEntries();
+
+void SPU::VolumeEnvelope::Reset(u8 rate_, bool decreasing_, bool exponential_)
 {
   rate = rate_;
   decreasing = decreasing_;
   exponential = exponential_;
 
-  // psx-spx says "The Phase bit seems to have no effect in Exponential Decrease mode."
-  // TODO: This needs to be tested on hardware.
-  phase_invert = phase_invert_ && !(decreasing_ && exponential_);
-
-  counter = 0;
-  counter_increment = 0x8000;
-
-  // negative level * negative step would give a positive number in decreasing+exponential mode, when we want it to be
-  // negative. Phase invert cause the step to be positive in decreasing mode, otherwise negative. Bitwise NOT, so that
-  // +7,+6,+5,+4 becomes -8,-7,-6,-5 as per psx-spx.
-  const s16 base_step = 7 - (rate & 3);
-  step = ((decreasing_ ^ phase_invert_) | (decreasing_ & exponential_)) ? ~base_step : base_step;
-  if (rate < 44)
-  {
-    // AdsrStep = StepValue SHL Max(0,11-ShiftValue)
-    step <<= (11 - (rate >> 2));
-  }
-  else if (rate >= 48)
-  {
-    // AdsrCycles = 1 SHL Max(0,ShiftValue-11)
-    counter_increment >>= ((rate >> 2) - 11);
-
-    // Rate of 0x7F (or more specifically all bits set, for decay/release) is a special case that never ticks.
-    if ((rate & rate_mask_) != rate_mask_)
-      counter_increment = std::max<u16>(counter_increment, 1u);
-  }
+  const ADSRTableEntry& table_entry = s_adsr_table[BoolToUInt8(decreasing)][rate];
+  counter = table_entry.ticks;
 }
 
-ALWAYS_INLINE_RELEASE bool SPU::VolumeEnvelope::Tick(s16& current_level)
+s16 SPU::VolumeEnvelope::Tick(s16 current_level)
 {
-  // Recompute step in exponential/decrement mode.
-  u32 this_increment = counter_increment;
-  s32 this_step = step;
+  counter--;
+  if (counter > 0)
+    return current_level;
+
+  const ADSRTableEntry& table_entry = s_adsr_table[BoolToUInt8(decreasing)][rate];
+  s32 this_step = table_entry.step;
+  counter = table_entry.ticks;
+
   if (exponential)
   {
     if (decreasing)
@@ -1784,42 +1183,19 @@ ALWAYS_INLINE_RELEASE bool SPU::VolumeEnvelope::Tick(s16& current_level)
         }
         else if (rate >= 44)
         {
-          this_increment >>= 2;
+          counter >>= 2;
         }
         else
         {
           this_step >>= 1;
-          this_increment >>= 1;
+          counter >>= 1;
         }
       }
     }
   }
 
-  counter += this_increment;
-
-  // Very strange behavior. Rate of 0x76 behaves like 0x6A, seems it's dependent on the MSB=1.
-  if (!(counter & 0x8000))
-    return true;
-  counter = 0;
-
-  // Phase invert acts very strange. If the volume is positive, it will decrease to zero, then increase back to maximum
-  // negative (inverted) volume. Except when decrementing, then it snaps straight to zero. Simply clamping to int16
-  // range will be fine for incrementing, because the volume never decreases past zero. If the volume _was_ negative,
-  // and is incrementing, hardware tests show that it only clamps to max, not 0.
-  s32 new_level = current_level + this_step;
-  if (!decreasing)
-  {
-    current_level = Truncate16(new_level = std::clamp(new_level, MIN_VOLUME, MAX_VOLUME));
-    return (new_level != ((this_step < 0) ? MIN_VOLUME : MAX_VOLUME));
-  }
-  else
-  {
-    if (phase_invert)
-      current_level = Truncate16(new_level = std::clamp(new_level, MIN_VOLUME, 0));
-    else
-      current_level = Truncate16(new_level = std::max(new_level, 0));
-    return (new_level == 0);
-  }
+  return static_cast<s16>(
+    std::clamp<s32>(static_cast<s32>(current_level) + this_step, ENVELOPE_MIN_VOLUME, ENVELOPE_MAX_VOLUME));
 }
 
 void SPU::VolumeSweep::Reset(VolumeRegister reg)
@@ -1831,8 +1207,8 @@ void SPU::VolumeSweep::Reset(VolumeRegister reg)
     return;
   }
 
-  envelope.Reset(reg.sweep_rate, 0x7F, reg.sweep_direction_decrease, reg.sweep_exponential, reg.sweep_phase_negative);
-  envelope_active = (envelope.counter_increment > 0);
+  envelope.Reset(reg.sweep_rate, reg.sweep_direction_decrease, reg.sweep_exponential);
+  envelope_active = true;
 }
 
 void SPU::VolumeSweep::Tick()
@@ -1840,7 +1216,9 @@ void SPU::VolumeSweep::Tick()
   if (!envelope_active)
     return;
 
-  envelope_active = envelope.Tick(current_level);
+  current_level = envelope.Tick(current_level);
+  envelope_active =
+    (envelope.decreasing ? (current_level > ENVELOPE_MIN_VOLUME) : (current_level < ENVELOPE_MAX_VOLUME));
 }
 
 void SPU::Voice::UpdateADSREnvelope()
@@ -1849,29 +1227,28 @@ void SPU::Voice::UpdateADSREnvelope()
   {
     case ADSRPhase::Off:
       adsr_target = 0;
-      adsr_envelope.Reset(0, 0, false, false, false);
+      adsr_envelope.Reset(0, false, false);
       return;
 
     case ADSRPhase::Attack:
       adsr_target = 32767; // 0 -> max
-      adsr_envelope.Reset(regs.adsr.attack_rate, 0x7F, false, regs.adsr.attack_exponential, false);
+      adsr_envelope.Reset(regs.adsr.attack_rate, false, regs.adsr.attack_exponential);
       break;
 
     case ADSRPhase::Decay:
       adsr_target = static_cast<s16>(std::min<s32>((u32(regs.adsr.sustain_level.GetValue()) + 1) * 0x800,
-                                                   VolumeEnvelope::MAX_VOLUME)); // max -> sustain level
-      adsr_envelope.Reset(regs.adsr.decay_rate_shr2 << 2, 0x1F << 2, true, true, false);
+                                                   ENVELOPE_MAX_VOLUME)); // max -> sustain level
+      adsr_envelope.Reset(regs.adsr.decay_rate_shr2 << 2, true, true);
       break;
 
     case ADSRPhase::Sustain:
       adsr_target = 0;
-      adsr_envelope.Reset(regs.adsr.sustain_rate, 0x7F, regs.adsr.sustain_direction_decrease,
-                          regs.adsr.sustain_exponential, false);
+      adsr_envelope.Reset(regs.adsr.sustain_rate, regs.adsr.sustain_direction_decrease, regs.adsr.sustain_exponential);
       break;
 
     case ADSRPhase::Release:
       adsr_target = 0;
-      adsr_envelope.Reset(regs.adsr.release_rate_shr2 << 2, 0x1F << 2, true, regs.adsr.release_exponential, false);
+      adsr_envelope.Reset(regs.adsr.release_rate_shr2 << 2, true, regs.adsr.release_exponential);
       break;
 
     default:
@@ -1881,8 +1258,7 @@ void SPU::Voice::UpdateADSREnvelope()
 
 void SPU::Voice::TickADSR()
 {
-  if (adsr_envelope.counter_increment > 0)
-    adsr_envelope.Tick(regs.adsr_volume);
+  regs.adsr_volume = adsr_envelope.Tick(regs.adsr_volume);
 
   if (adsr_phase != ADSRPhase::Sustain)
   {
@@ -1898,8 +1274,8 @@ void SPU::Voice::TickADSR()
 
 void SPU::Voice::DecodeBlock(const ADPCMBlock& block)
 {
-  static constexpr std::array<s8, 16> filter_table_pos = {{0, 60, 115, 98, 122, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}};
-  static constexpr std::array<s8, 16> filter_table_neg = {{0, 0, -52, -55, -60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}};
+  static constexpr std::array<s32, 5> filter_table_pos = {{0, 60, 115, 98, 122}};
+  static constexpr std::array<s32, 5> filter_table_neg = {{0, 0, -52, -55, -60}};
 
   // store samples needed for interpolation
   current_block_samples[2] = current_block_samples[NUM_SAMPLES_FROM_LAST_ADPCM_BLOCK + NUM_SAMPLES_PER_ADPCM_BLOCK - 1];
@@ -2013,43 +1389,34 @@ void SPU::ReadADPCMBlock(u16 address, ADPCMBlock* block)
   u32 ram_address = (ZeroExtend32(address) * 8) & RAM_MASK;
   if (IsRAMIRQTriggerable() && (CheckRAMIRQ(ram_address) || CheckRAMIRQ((ram_address + 8) & RAM_MASK)))
   {
-    DEBUG_LOG("Trigger IRQ @ {:08X} ({:04X}) from ADPCM reader", ram_address, ram_address / 8);
+    Log_DebugPrintf("Trigger IRQ @ %08X %04X from ADPCM reader", ram_address, ram_address / 8);
     TriggerRAMIRQ();
   }
 
   // fast path - no wrap-around
   if ((ram_address + sizeof(ADPCMBlock)) <= RAM_SIZE)
   {
-    std::memcpy(block, &s_ram[ram_address], sizeof(ADPCMBlock));
+    std::memcpy(block, &m_ram[ram_address], sizeof(ADPCMBlock));
     return;
   }
 
-  block->shift_filter.bits = s_ram[ram_address];
+  block->shift_filter.bits = m_ram[ram_address];
   ram_address = (ram_address + 1) & RAM_MASK;
-  block->flags.bits = s_ram[ram_address];
+  block->flags.bits = m_ram[ram_address];
   ram_address = (ram_address + 1) & RAM_MASK;
   for (u32 i = 0; i < 14; i++)
   {
-    block->data[i] = s_ram[ram_address];
+    block->data[i] = m_ram[ram_address];
     ram_address = (ram_address + 1) & RAM_MASK;
   }
 }
 
 ALWAYS_INLINE_RELEASE std::tuple<s32, s32> SPU::SampleVoice(u32 voice_index)
 {
-  Voice& voice = s_state.voices[voice_index];
-  if (!voice.IsOn() && !s_state.SPUCNT.irq9_enable)
+  Voice& voice = m_voices[voice_index];
+  if (!voice.IsOn() && !m_SPUCNT.irq9_enable)
   {
     voice.last_volume = 0;
-
-#ifdef SPU_DUMP_ALL_VOICES
-    if (s_state.s_voice_dump_writers[voice_index])
-    {
-      const s16 dump_samples[2] = {0, 0};
-      s_state.s_voice_dump_writers[voice_index]->WriteFrames(dump_samples, 1);
-    }
-#endif
-
     return {};
   }
 
@@ -2062,7 +1429,7 @@ ALWAYS_INLINE_RELEASE std::tuple<s32, s32> SPU::SampleVoice(u32 voice_index)
 
     if (voice.current_block_flags.loop_start && !voice.ignore_loop_address)
     {
-      TRACE_LOG("Voice {} loop start @ 0x{:08X}", voice_index, voice.current_address);
+      Log_TracePrintf("Voice %u loop start @ 0x%08X", voice_index, ZeroExtend32(voice.current_address));
       voice.regs.adpcm_repeat_address = voice.current_address;
     }
   }
@@ -2094,7 +1461,7 @@ ALWAYS_INLINE_RELEASE std::tuple<s32, s32> SPU::SampleVoice(u32 voice_index)
   u16 step = voice.regs.adpcm_sample_rate;
   if (IsPitchModulationEnabled(voice_index))
   {
-    const s32 factor = std::clamp<s32>(s_state.voices[voice_index - 1].last_volume, -0x8000, 0x7FFF) + 0x8000;
+    const s32 factor = std::clamp<s32>(m_voices[voice_index - 1].last_volume, -0x8000, 0x7FFF) + 0x8000;
     step = Truncate16(static_cast<u32>((SignExtend32(step) * factor) >> 15));
   }
   step = std::min<u16>(step, 0x3FFF);
@@ -2116,25 +1483,17 @@ ALWAYS_INLINE_RELEASE std::tuple<s32, s32> SPU::SampleVoice(u32 voice_index)
     // handle flags
     if (voice.current_block_flags.loop_end)
     {
-      s_state.endx_register |= (u32(1) << voice_index);
+      m_endx_register |= (u32(1) << voice_index);
       voice.current_address = voice.regs.adpcm_repeat_address & ~u16(1);
 
       if (!voice.current_block_flags.loop_repeat)
       {
-        // End+Mute flags are ignored when noise is enabled. ADPCM data is still decoded.
-        if (!IsVoiceNoiseEnabled(voice_index))
-        {
-          TRACE_LOG("Voice {} loop end+mute @ 0x{:04X}", voice_index, voice.current_address);
-          voice.ForceOff();
-        }
-        else
-        {
-          TRACE_LOG("IGNORING voice {} loop end+mute @ 0x{:04X}", voice_index, voice.current_address);
-        }
+        Log_TracePrintf("Voice %u loop end+mute @ 0x%08X", voice_index, ZeroExtend32(voice.current_address));
+        voice.ForceOff();
       }
       else
       {
-        TRACE_LOG("Voice {} loop end+repeat @ 0x{:04X}", voice_index, voice.current_address);
+        Log_TracePrintf("Voice %u loop end+repeat @ 0x%08X", voice_index, ZeroExtend32(voice.current_address));
       }
     }
   }
@@ -2144,20 +1503,6 @@ ALWAYS_INLINE_RELEASE std::tuple<s32, s32> SPU::SampleVoice(u32 voice_index)
   const s32 right = ApplyVolume(volume, voice.right_volume.current_level);
   voice.left_volume.Tick();
   voice.right_volume.Tick();
-
-#ifdef SPU_ENABLE_VU_METER
-  if (IsVUMeterActive())
-    UpdateDebugPeaks(s_state.voice_peaks[voice_index], left, right);
-#endif
-
-#ifdef SPU_DUMP_ALL_VOICES
-  if (s_state.s_voice_dump_writers[voice_index])
-  {
-    const s16 dump_samples[2] = {static_cast<s16>(Clamp16(left)), static_cast<s16>(Clamp16(right))};
-    s_state.s_voice_dump_writers[voice_index]->WriteFrames(dump_samples, 1);
-  }
-#endif
-
   return std::make_tuple(left, right);
 }
 
@@ -2169,29 +1514,33 @@ void SPU::UpdateNoise()
      0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1}};
   static constexpr std::array<u8, 5> noise_freq_add = {{0, 84, 140, 180, 210}};
 
-  const u32 noise_clock = s_state.SPUCNT.noise_clock;
+  const u32 noise_clock = m_SPUCNT.noise_clock;
   const u32 level = (0x8000u >> (noise_clock >> 2)) << 16;
 
-  s_state.noise_count += 0x10000u + noise_freq_add[noise_clock & 3u];
-  if ((s_state.noise_count & 0xFFFFu) >= noise_freq_add[4])
+  m_noise_count += 0x10000u + noise_freq_add[noise_clock & 3u];
+  if ((m_noise_count & 0xFFFFu) >= noise_freq_add[4])
   {
-    s_state.noise_count += 0x10000;
-    s_state.noise_count -= noise_freq_add[noise_clock & 3u];
+    m_noise_count += 0x10000;
+    m_noise_count -= noise_freq_add[noise_clock & 3u];
   }
 
-  if (s_state.noise_count < level)
+  if (m_noise_count < level)
     return;
 
-  s_state.noise_count %= level;
-  s_state.noise_level = (s_state.noise_level << 1) | noise_wave_add[(s_state.noise_level >> 10) & 63u];
+  m_noise_count %= level;
+  m_noise_level = (m_noise_level << 1) | noise_wave_add[(m_noise_level >> 10) & 63u];
 }
 
-u32 SPU::ReverbMemoryAddress(u32 address)
+/************************************************************************/
+/* Reverb algorithm from Mednafen-PSX                                   */
+/************************************************************************/
+
+u32 SPU::ReverbMemoryAddress(u32 address) const
 {
   // Ensures address does not leave the reverb work area.
   static constexpr u32 MASK = (RAM_SIZE - 1) / 2;
-  u32 offset = s_state.reverb_current_address + (address & MASK);
-  offset += s_state.reverb_base_address & ((s32)(offset << 13) >> 31);
+  u32 offset = m_reverb_current_address + (address & MASK);
+  offset += m_reverb_base_address & ((s32)(offset << 13) >> 31);
 
   // We address RAM in bytes. TODO: Change this to words.
   return (offset & MASK) * 2u;
@@ -2203,7 +1552,7 @@ s16 SPU::ReverbRead(u32 address, s32 offset)
   const u32 real_address = ReverbMemoryAddress((address << 2) + offset);
 
   s16 data;
-  std::memcpy(&data, &s_ram[real_address], sizeof(data));
+  std::memcpy(&data, &m_ram[real_address], sizeof(data));
   return data;
 }
 
@@ -2211,204 +1560,181 @@ void SPU::ReverbWrite(u32 address, s16 data)
 {
   // TODO: This should check interrupts.
   const u32 real_address = ReverbMemoryAddress(address << 2);
-  std::memcpy(&s_ram[real_address], &data, sizeof(data));
+  std::memcpy(&m_ram[real_address], &data, sizeof(data));
 }
 
-void SPU::ProcessReverb(s32 left_in, s32 right_in, s32* left_out, s32* right_out)
+// Zeroes optimized out; middle removed too(it's 16384)
+static constexpr std::array<s16, 20> s_reverb_resample_coefficients = {
+  -1, 2, -10, 35, -103, 266, -616, 1332, -2960, 10246, 10246, -2960, 1332, -616, 266, -103, 35, -10, 2, -1,
+};
+static s16 s_last_reverb_input[2];
+static s32 s_last_reverb_output[2];
+
+ALWAYS_INLINE static s32 Reverb4422(const s16* src)
 {
-  // From PSX-SPX:
-  // Input and output to/from the reverb unit is resampled using a 39-tap FIR filter with the following coefficients.
-  //  -0001h,  0000h,  0002h,  0000h, -000Ah,  0000h,  0023h,  0000h,
-  //  -0067h,  0000h,  010Ah,  0000h, -0268h,  0000h,  0534h,  0000h,
-  //  -0B90h,  0000h,  2806h,  4000h,  2806h,  0000h, -0B90h,  0000h,
-  //   0534h,  0000h, -0268h,  0000h,  010Ah,  0000h, -0067h,  0000h,
-  //   0023h,  0000h, -000Ah,  0000h,  0002h,  0000h, -0001h
-  //
-  // Zeros have been removed since the result is always zero, therefore the multiply is redundant.
+  s32 out = 0; // 32-bits is adequate(it won't overflow)
+  for (u32 i = 0; i < 20; i++)
+    out += s_reverb_resample_coefficients[i] * src[i * 2];
 
-  alignas(VECTOR_ALIGNMENT) static constexpr std::array<s32, 20> resample_coeff = {
-    -0x0001, 0x0002,  -0x000A, 0x0023,  -0x0067, 0x010A,  -0x0268, 0x0534,  -0x0B90, 0x2806,
-    0x2806,  -0x0B90, 0x0534,  -0x0268, 0x010A,  -0x0067, 0x0023,  -0x000A, 0x0002,  -0x0001};
+  // Middle non-zero
+  out += 0x4000 * src[19];
+  out >>= 15;
+  return std::clamp<s32>(out, -32768, 32767);
+}
 
-  static constexpr auto iiasm = [](const s16 insamp) {
-    if (s_state.reverb_registers.IIR_ALPHA == -32768) [[unlikely]]
-      return (insamp == -32768) ? 0 : (insamp * -65536);
-    else
-      return insamp * (32768 - s_state.reverb_registers.IIR_ALPHA);
-  };
-
-  static constexpr auto neg = [](s32 samp) { return (samp == -32768) ? 0x7FFF : -samp; };
-
-  s_state.last_reverb_input[0] = Truncate16(left_in);
-  s_state.last_reverb_input[1] = Truncate16(right_in);
-
-  // Resampling buffer is duplicated to avoid having to manually wrap the index.
-  s_state.reverb_downsample_buffer[0][s_state.reverb_resample_buffer_position | 0x00] =
-    s_state.reverb_downsample_buffer[0][s_state.reverb_resample_buffer_position | 0x40] = Truncate16(left_in);
-  s_state.reverb_downsample_buffer[1][s_state.reverb_resample_buffer_position | 0x00] =
-    s_state.reverb_downsample_buffer[1][s_state.reverb_resample_buffer_position | 0x40] = Truncate16(right_in);
-
-  // Reverb algorithm from Mednafen-PSX, rewritten/vectorized.
-  s32 out[2];
-  if (s_state.reverb_resample_buffer_position & 1u)
+template<bool phase>
+ALWAYS_INLINE static s32 Reverb2244(const s16* src)
+{
+  s32 out; // 32-bits is adequate(it won't overflow)
+  if (phase)
   {
-    std::array<s32, 2> downsampled;
-    for (size_t channel = 0; channel < 2; channel++)
-    {
-      const s16* src =
-        &s_state.reverb_downsample_buffer[channel][(s_state.reverb_resample_buffer_position - 38) & 0x3F];
-      GSVector4i acc =
-        GSVector4i::load<true>(&resample_coeff[0]).mul32l(GSVector4i::load<false>(&src[0]).sll32(16).sra32(16));
-      acc = acc.add32(
-        GSVector4i::load<true>(&resample_coeff[4]).mul32l(GSVector4i::load<false>(&src[8]).sll32(16).sra32(16)));
-      acc = acc.add32(
-        GSVector4i::load<true>(&resample_coeff[8]).mul32l(GSVector4i::load<false>(&src[16]).sll32(16).sra32(16)));
-      acc = acc.add32(
-        GSVector4i::load<true>(&resample_coeff[12]).mul32l(GSVector4i::load<false>(&src[24]).sll32(16).sra32(16)));
-      acc = acc.add32(
-        GSVector4i::load<true>(&resample_coeff[16]).mul32l(GSVector4i::load<false>(&src[32]).sll32(16).sra32(16)));
-
-      // Horizontal reduction, middle 0x4000. Moved here so we don't need another 4 elements above.
-      downsampled[channel] = Clamp16((acc.addv_s32() + (0x4000 * src[19])) >> 15);
-    }
-
-    for (size_t channel = 0; channel < 2; channel++)
-    {
-      if (s_state.SPUCNT.reverb_master_enable)
-      {
-        // Input from Mixer (Input volume multiplied with incoming data).
-        const s32 IIR_INPUT_A = Clamp16(
-          (((ReverbRead(s_state.reverb_registers.IIR_SRC_A[channel ^ 0]) * s_state.reverb_registers.IIR_COEF) >> 14) +
-           ((downsampled[channel] * s_state.reverb_registers.IN_COEF[channel]) >> 14)) >>
-          1);
-        const s32 IIR_INPUT_B = Clamp16(
-          (((ReverbRead(s_state.reverb_registers.IIR_SRC_B[channel ^ 1]) * s_state.reverb_registers.IIR_COEF) >> 14) +
-           ((downsampled[channel] * s_state.reverb_registers.IN_COEF[channel]) >> 14)) >>
-          1);
-
-        // Same Side Reflection (left-to-left and right-to-right).
-        const s32 IIR_A = Clamp16((((IIR_INPUT_A * s_state.reverb_registers.IIR_ALPHA) >> 14) +
-                                   (iiasm(ReverbRead(s_state.reverb_registers.IIR_DEST_A[channel], -1)) >> 14)) >>
-                                  1);
-
-        // Different Side Reflection (left-to-right and right-to-left).
-        const s32 IIR_B = Clamp16((((IIR_INPUT_B * s_state.reverb_registers.IIR_ALPHA) >> 14) +
-                                   (iiasm(ReverbRead(s_state.reverb_registers.IIR_DEST_B[channel], -1)) >> 14)) >>
-                                  1);
-
-        ReverbWrite(s_state.reverb_registers.IIR_DEST_A[channel], Truncate16(IIR_A));
-        ReverbWrite(s_state.reverb_registers.IIR_DEST_B[channel], Truncate16(IIR_B));
-      }
-
-      // Early Echo (Comb Filter, with input from buffer).
-      const s32 ACC =
-        ((ReverbRead(s_state.reverb_registers.ACC_SRC_A[channel]) * s_state.reverb_registers.ACC_COEF_A) >> 14) +
-        ((ReverbRead(s_state.reverb_registers.ACC_SRC_B[channel]) * s_state.reverb_registers.ACC_COEF_B) >> 14) +
-        ((ReverbRead(s_state.reverb_registers.ACC_SRC_C[channel]) * s_state.reverb_registers.ACC_COEF_C) >> 14) +
-        ((ReverbRead(s_state.reverb_registers.ACC_SRC_D[channel]) * s_state.reverb_registers.ACC_COEF_D) >> 14);
-
-      // Late Reverb APF1 (All Pass Filter 1, with input from COMB).
-      const s32 FB_A = ReverbRead(s_state.reverb_registers.MIX_DEST_A[channel] - s_state.reverb_registers.FB_SRC_A);
-      const s32 FB_B = ReverbRead(s_state.reverb_registers.MIX_DEST_B[channel] - s_state.reverb_registers.FB_SRC_B);
-      const s32 MDA = Clamp16((ACC + ((FB_A * neg(s_state.reverb_registers.FB_ALPHA)) >> 14)) >> 1);
-
-      // Late Reverb APF2 (All Pass Filter 2, with input from APF1).
-      const s32 MDB = Clamp16(FB_A + ((((MDA * s_state.reverb_registers.FB_ALPHA) >> 14) +
-                                       ((FB_B * neg(s_state.reverb_registers.FB_X)) >> 14)) >>
-                                      1));
-
-      // 22050hz sample output.
-      s_state.reverb_upsample_buffer[channel][(s_state.reverb_resample_buffer_position >> 1) | 0x20] =
-        s_state.reverb_upsample_buffer[channel][s_state.reverb_resample_buffer_position >> 1] =
-          Truncate16(Clamp16(FB_B + ((MDB * s_state.reverb_registers.FB_X) >> 15)));
-
-      if (s_state.SPUCNT.reverb_master_enable)
-      {
-        ReverbWrite(s_state.reverb_registers.MIX_DEST_A[channel], Truncate16(MDA));
-        ReverbWrite(s_state.reverb_registers.MIX_DEST_B[channel], Truncate16(MDB));
-      }
-    }
-
-    s_state.reverb_current_address = (s_state.reverb_current_address + 1) & 0x3FFFFu;
-    s_state.reverb_current_address =
-      (s_state.reverb_current_address == 0) ? s_state.reverb_base_address : s_state.reverb_current_address;
-
-    for (size_t channel = 0; channel < 2; channel++)
-    {
-      const s16* src =
-        &s_state.reverb_upsample_buffer[channel][((s_state.reverb_resample_buffer_position >> 1) - 19) & 0x1F];
-
-      GSVector4i srcs = GSVector4i::load<false>(&src[0]);
-      GSVector4i acc = GSVector4i::load<true>(&resample_coeff[0]).mul32l(srcs.s16to32());
-      acc = acc.add32(GSVector4i::load<true>(&resample_coeff[4]).mul32l(srcs.uph64().s16to32()));
-      srcs = GSVector4i::load<false>(&src[8]);
-      acc = acc.add32(GSVector4i::load<true>(&resample_coeff[8]).mul32l(srcs.s16to32()));
-      acc = acc.add32(GSVector4i::load<true>(&resample_coeff[12]).mul32l(srcs.uph64().s16to32()));
-      srcs = GSVector4i::loadl<false>(&src[16]);
-      acc = acc.add32(GSVector4i::load<true>(&resample_coeff[16]).mul32l(srcs.s16to32()));
-
-      out[channel] = std::clamp<s32>(acc.addv_s32() >> 14, -32768, 32767);
-    }
+    // Middle non-zero
+    out = src[9];
   }
   else
   {
-    const size_t idx = (((s_state.reverb_resample_buffer_position >> 1) - 19) & 0x1F) + 9;
-    for (unsigned lr = 0; lr < 2; lr++)
-      out[lr] = s_state.reverb_upsample_buffer[lr][idx];
+    out = 0;
+    for (u32 i = 0; i < 20; i++)
+      out += s_reverb_resample_coefficients[i] * src[i];
+
+    out >>= 14;
+    out = std::clamp<s32>(out, -32768, 32767);
   }
 
-  s_state.reverb_resample_buffer_position = (s_state.reverb_resample_buffer_position + 1) & 0x3F;
-
-  s_state.last_reverb_output[0] = *left_out = ApplyVolume(out[0], s_state.reverb_registers.vLOUT);
-  s_state.last_reverb_output[1] = *right_out = ApplyVolume(out[1], s_state.reverb_registers.vROUT);
-
-#ifdef SPU_ENABLE_VU_METER
-  if (IsVUMeterActive())
-    UpdateDebugPeaks(s_state.reverb_peaks, *left_out, *right_out);
-#endif
-
-#ifdef SPU_DUMP_ALL_VOICES
-  if (s_state.s_voice_dump_writers[NUM_VOICES])
-  {
-    const s16 dump_samples[2] = {static_cast<s16>(Clamp16(s_state.last_reverb_output[0])),
-                                 static_cast<s16>(Clamp16(s_state.last_reverb_output[1]))};
-    s_state.s_voice_dump_writers[NUM_VOICES]->WriteFrames(dump_samples, 1);
-  }
-#endif
+  return out;
 }
 
-void SPU::Execute(void* param, TickCount ticks, TickCount ticks_late)
+ALWAYS_INLINE static s16 ReverbSat(s32 val)
+{
+  return static_cast<s16>(std::clamp<s32>(val, -0x8000, 0x7FFF));
+}
+
+ALWAYS_INLINE static s16 ReverbNeg(s16 samp)
+{
+  if (samp == -32768)
+    return 0x7FFF;
+
+  return -samp;
+}
+
+ALWAYS_INLINE static s32 IIASM(const s16 IIR_ALPHA, const s16 insamp)
+{
+  if (IIR_ALPHA == -32768)
+  {
+    if (insamp == -32768)
+      return 0;
+    else
+      return insamp * -65536;
+  }
+  else
+    return insamp * (32768 - IIR_ALPHA);
+}
+
+void SPU::ProcessReverb(s16 left_in, s16 right_in, s32* left_out, s32* right_out)
+{
+  s_last_reverb_input[0] = left_in;
+  s_last_reverb_input[1] = right_in;
+  m_reverb_downsample_buffer[0][m_reverb_resample_buffer_position | 0x00] = left_in;
+  m_reverb_downsample_buffer[0][m_reverb_resample_buffer_position | 0x40] = left_in;
+  m_reverb_downsample_buffer[1][m_reverb_resample_buffer_position | 0x00] = right_in;
+  m_reverb_downsample_buffer[1][m_reverb_resample_buffer_position | 0x40] = right_in;
+
+  s32 out[2];
+  if (m_reverb_resample_buffer_position & 1u)
+  {
+    std::array<s32, 2> downsampled;
+    for (unsigned lr = 0; lr < 2; lr++)
+      downsampled[lr] = Reverb4422(&m_reverb_downsample_buffer[lr][(m_reverb_resample_buffer_position - 38) & 0x3F]);
+
+    for (unsigned lr = 0; lr < 2; lr++)
+    {
+      if (m_SPUCNT.reverb_master_enable)
+      {
+        const s16 IIR_INPUT_A =
+          ReverbSat((((ReverbRead(m_reverb_registers.IIR_SRC_A[lr ^ 0]) * m_reverb_registers.IIR_COEF) >> 14) +
+                     ((downsampled[lr] * m_reverb_registers.IN_COEF[lr]) >> 14)) >>
+                    1);
+        const s16 IIR_INPUT_B =
+          ReverbSat((((ReverbRead(m_reverb_registers.IIR_SRC_B[lr ^ 1]) * m_reverb_registers.IIR_COEF) >> 14) +
+                     ((downsampled[lr] * m_reverb_registers.IN_COEF[lr]) >> 14)) >>
+                    1);
+        const s16 IIR_A =
+          ReverbSat((((IIR_INPUT_A * m_reverb_registers.IIR_ALPHA) >> 14) +
+                     (IIASM(m_reverb_registers.IIR_ALPHA, ReverbRead(m_reverb_registers.IIR_DEST_A[lr], -1)) >> 14)) >>
+                    1);
+        const s16 IIR_B =
+          ReverbSat((((IIR_INPUT_B * m_reverb_registers.IIR_ALPHA) >> 14) +
+                     (IIASM(m_reverb_registers.IIR_ALPHA, ReverbRead(m_reverb_registers.IIR_DEST_B[lr], -1)) >> 14)) >>
+                    1);
+
+        ReverbWrite(m_reverb_registers.IIR_DEST_A[lr], IIR_A);
+        ReverbWrite(m_reverb_registers.IIR_DEST_B[lr], IIR_B);
+      }
+
+      const s32 ACC = ((ReverbRead(m_reverb_registers.ACC_SRC_A[lr]) * m_reverb_registers.ACC_COEF_A) >> 14) +
+                      ((ReverbRead(m_reverb_registers.ACC_SRC_B[lr]) * m_reverb_registers.ACC_COEF_B) >> 14) +
+                      ((ReverbRead(m_reverb_registers.ACC_SRC_C[lr]) * m_reverb_registers.ACC_COEF_C) >> 14) +
+                      ((ReverbRead(m_reverb_registers.ACC_SRC_D[lr]) * m_reverb_registers.ACC_COEF_D) >> 14);
+
+      const s16 FB_A = ReverbRead(m_reverb_registers.MIX_DEST_A[lr] - m_reverb_registers.FB_SRC_A);
+      const s16 FB_B = ReverbRead(m_reverb_registers.MIX_DEST_B[lr] - m_reverb_registers.FB_SRC_B);
+      const s16 MDA = ReverbSat((ACC + ((FB_A * ReverbNeg(m_reverb_registers.FB_ALPHA)) >> 14)) >> 1);
+      const s16 MDB = ReverbSat(
+        FB_A +
+        ((((MDA * m_reverb_registers.FB_ALPHA) >> 14) + ((FB_B * ReverbNeg(m_reverb_registers.FB_X)) >> 14)) >> 1));
+      const s16 IVB = ReverbSat(FB_B + ((MDB * m_reverb_registers.FB_X) >> 15));
+
+      if (m_SPUCNT.reverb_master_enable)
+      {
+        ReverbWrite(m_reverb_registers.MIX_DEST_A[lr], MDA);
+        ReverbWrite(m_reverb_registers.MIX_DEST_B[lr], MDB);
+      }
+
+      m_reverb_upsample_buffer[lr][(m_reverb_resample_buffer_position >> 1) | 0x20] =
+        m_reverb_upsample_buffer[lr][m_reverb_resample_buffer_position >> 1] = IVB;
+    }
+
+    m_reverb_current_address = (m_reverb_current_address + 1) & 0x3FFFFu;
+    if (m_reverb_current_address == 0)
+      m_reverb_current_address = m_reverb_base_address;
+
+    for (unsigned lr = 0; lr < 2; lr++)
+      out[lr] =
+        Reverb2244<false>(&m_reverb_upsample_buffer[lr][((m_reverb_resample_buffer_position >> 1) - 19) & 0x1F]);
+  }
+  else
+  {
+    for (unsigned lr = 0; lr < 2; lr++)
+      out[lr] = Reverb2244<true>(&m_reverb_upsample_buffer[lr][((m_reverb_resample_buffer_position >> 1) - 19) & 0x1F]);
+  }
+
+  m_reverb_resample_buffer_position = (m_reverb_resample_buffer_position + 1) & 0x3F;
+
+  s_last_reverb_output[0] = *left_out = ApplyVolume(out[0], m_reverb_registers.vLOUT);
+  s_last_reverb_output[1] = *right_out = ApplyVolume(out[1], m_reverb_registers.vROUT);
+}
+
+void SPU::Execute(TickCount ticks)
 {
   u32 remaining_frames;
   if (g_settings.cpu_overclock_active)
   {
     // (X * D) / N / 768 -> (X * D) / (N * 768)
-    const u64 num =
-      (static_cast<u64>(ticks) * g_settings.cpu_overclock_denominator) + static_cast<u32>(s_state.ticks_carry);
-    remaining_frames = static_cast<u32>(num / s_state.cpu_tick_divider);
-    s_state.ticks_carry = static_cast<TickCount>(num % s_state.cpu_tick_divider);
+    const u64 num = (static_cast<u64>(ticks) * g_settings.cpu_overclock_denominator) + static_cast<u32>(m_ticks_carry);
+    remaining_frames = static_cast<u32>(num / m_cpu_tick_divider);
+    m_ticks_carry = static_cast<TickCount>(num % m_cpu_tick_divider);
   }
   else
   {
-    remaining_frames = static_cast<u32>((ticks + s_state.ticks_carry) / SYSCLK_TICKS_PER_SPU_TICK);
-    s_state.ticks_carry = (ticks + s_state.ticks_carry) % SYSCLK_TICKS_PER_SPU_TICK;
+    remaining_frames = static_cast<u32>((ticks + m_ticks_carry) / SYSCLK_TICKS_PER_SPU_TICK);
+    m_ticks_carry = (ticks + m_ticks_carry) % SYSCLK_TICKS_PER_SPU_TICK;
   }
 
   while (remaining_frames > 0)
   {
     s16* output_frame_start;
     u32 output_frame_space = remaining_frames;
-    if (!s_state.audio_output_muted) [[likely]]
-    {
-      output_frame_space = remaining_frames;
-      s_state.audio_stream.BeginWrite(&output_frame_start, &output_frame_space);
-    }
-    else
-    {
-      // dummy space for writing samples when using runahead
-      output_frame_start = s_muted_output_buffer.data();
-      output_frame_space = std::min(static_cast<u32>(s_muted_output_buffer.size() / 2), remaining_frames);
-    }
+    m_audio_stream->BeginWrite(&output_frame_start, &output_frame_space);
 
     s16* output_frame = output_frame_start;
     const u32 frames_in_this_batch = std::min(remaining_frames, output_frame_space);
@@ -2419,7 +1745,7 @@ void SPU::Execute(void* param, TickCount ticks, TickCount ticks_late)
       s32 reverb_in_left = 0;
       s32 reverb_in_right = 0;
 
-      u32 reverb_on_register = s_state.reverb_on_register;
+      u32 reverb_on_register = m_reverb_on_register;
 
       for (u32 voice = 0; voice < NUM_VOICES; voice++)
       {
@@ -2435,107 +1761,83 @@ void SPU::Execute(void* param, TickCount ticks, TickCount ticks_late)
         reverb_on_register >>= 1;
       }
 
-      if (!s_state.SPUCNT.mute_n)
+      if (!m_SPUCNT.mute_n)
       {
         left_sum = 0;
         right_sum = 0;
-        reverb_in_left = 0;
-        reverb_in_right = 0;
       }
 
       // Update noise once per frame.
       UpdateNoise();
 
       // Mix in CD audio.
-      const auto [cd_audio_left, cd_audio_right] = CDROM::GetAudioFrame();
-      if (s_state.SPUCNT.cd_audio_enable)
+      const auto [cd_audio_left, cd_audio_right] = g_cdrom.GetAudioFrame();
+      if (m_SPUCNT.cd_audio_enable)
       {
-        const s32 cd_audio_volume_left = ApplyVolume(s32(cd_audio_left), s_state.cd_audio_volume_left);
-        const s32 cd_audio_volume_right = ApplyVolume(s32(cd_audio_right), s_state.cd_audio_volume_right);
+        const s32 cd_audio_volume_left = ApplyVolume(s32(cd_audio_left), m_cd_audio_volume_left);
+        const s32 cd_audio_volume_right = ApplyVolume(s32(cd_audio_right), m_cd_audio_volume_right);
 
         left_sum += cd_audio_volume_left;
         right_sum += cd_audio_volume_right;
 
-        if (s_state.SPUCNT.cd_audio_reverb)
+        if (m_SPUCNT.cd_audio_reverb)
         {
           reverb_in_left += cd_audio_volume_left;
           reverb_in_right += cd_audio_volume_right;
         }
-
-#ifdef SPU_ENABLE_VU_METER
-        if (IsVUMeterActive())
-          UpdateDebugPeaks(s_state.cd_audio_peaks, cd_audio_volume_left, cd_audio_volume_right);
-#endif
       }
 
       // Compute reverb.
       s32 reverb_out_left, reverb_out_right;
-      ProcessReverb(Clamp16(reverb_in_left), Clamp16(reverb_in_right), &reverb_out_left, &reverb_out_right);
+      ProcessReverb(static_cast<s16>(Clamp16(reverb_in_left)), static_cast<s16>(Clamp16(reverb_in_right)),
+                    &reverb_out_left, &reverb_out_right);
 
       // Mix in reverb.
       left_sum += reverb_out_left;
       right_sum += reverb_out_right;
 
       // Apply main volume after clamping. A maximum volume should not overflow here because both are 16-bit values.
-#ifdef SPU_ENABLE_VU_METER
-      const s16 final_left = static_cast<s16>(ApplyVolume(Clamp16(left_sum), s_state.main_volume_left.current_level));
-      const s16 final_right =
-        static_cast<s16>(ApplyVolume(Clamp16(right_sum), s_state.main_volume_right.current_level));
-      *(output_frame++) = final_left;
-      *(output_frame++) = final_right;
-
-      if (IsVUMeterActive())
-        UpdateDebugPeaks(s_state.output_peaks, final_left, final_right);
-#else
-      *(output_frame++) = static_cast<s16>(ApplyVolume(Clamp16(left_sum), s_state.main_volume_left.current_level));
-      *(output_frame++) = static_cast<s16>(ApplyVolume(Clamp16(right_sum), s_state.main_volume_right.current_level));
-#endif
-
-      s_state.main_volume_left.Tick();
-      s_state.main_volume_right.Tick();
+      *(output_frame++) = static_cast<s16>(ApplyVolume(Clamp16(left_sum), m_main_volume_left.current_level));
+      *(output_frame++) = static_cast<s16>(ApplyVolume(Clamp16(right_sum), m_main_volume_right.current_level));
+      m_main_volume_left.Tick();
+      m_main_volume_right.Tick();
 
       // Write to capture buffers.
       WriteToCaptureBuffer(0, cd_audio_left);
       WriteToCaptureBuffer(1, cd_audio_right);
-      WriteToCaptureBuffer(2, static_cast<s16>(Clamp16(s_state.voices[1].last_volume)));
-      WriteToCaptureBuffer(3, static_cast<s16>(Clamp16(s_state.voices[3].last_volume)));
+      WriteToCaptureBuffer(2, static_cast<s16>(Clamp16(m_voices[1].last_volume)));
+      WriteToCaptureBuffer(3, static_cast<s16>(Clamp16(m_voices[3].last_volume)));
       IncrementCaptureBufferPosition();
 
       // Key off/on voices after the first frame.
-      if (i == 0 && (s_state.key_off_register != 0 || s_state.key_on_register != 0))
+      if (i == 0 && (m_key_off_register != 0 || m_key_on_register != 0))
       {
-        u32 key_off_register = s_state.key_off_register;
-        s_state.key_off_register = 0;
+        u32 key_off_register = m_key_off_register;
+        m_key_off_register = 0;
 
-        u32 key_on_register = s_state.key_on_register;
-        s_state.key_on_register = 0;
+        u32 key_on_register = m_key_on_register;
+        m_key_on_register = 0;
 
         for (u32 voice = 0; voice < NUM_VOICES; voice++)
         {
           if (key_off_register & 1u)
-            s_state.voices[voice].KeyOff();
+            m_voices[voice].KeyOff();
           key_off_register >>= 1;
 
           if (key_on_register & 1u)
           {
-            s_state.endx_register &= ~(1u << voice);
-            s_state.voices[voice].KeyOn();
+            m_endx_register &= ~(1u << voice);
+            m_voices[voice].KeyOn();
           }
           key_on_register >>= 1;
         }
       }
     }
 
-#ifndef __ANDROID__
-    if (MediaCapture* cap = System::GetMediaCapture()) [[unlikely]]
-    {
-      if (!cap->DeliverAudioFrames(output_frame_start, frames_in_this_batch))
-        System::StopMediaCapture();
-    }
-#endif
+    if (m_dump_writer)
+      m_dump_writer->WriteFrames(output_frame_start, frames_in_this_batch);
 
-    if (!s_state.audio_output_muted) [[likely]]
-      s_state.audio_stream.EndWrite(frames_in_this_batch);
+    m_audio_stream->EndWrite(frames_in_this_batch);
     remaining_frames -= frames_in_this_batch;
   }
 }
@@ -2545,176 +1847,139 @@ void SPU::UpdateEventInterval()
   // Don't generate more than the audio buffer since in a single slice, otherwise we'll both overflow the buffers when
   // we do write it, and the audio thread will underflow since it won't have enough data it the game isn't messing with
   // the SPU state.
-  const u32 max_slice_frames = s_state.audio_stream.GetBufferSize();
+  const u32 max_slice_frames = g_host_interface->GetAudioStream()->GetBufferSize();
 
   // TODO: Make this predict how long until the interrupt will be hit instead...
-  const u32 interval = (s_state.SPUCNT.enable && s_state.SPUCNT.irq9_enable) ? 1 : max_slice_frames;
-  const TickCount interval_ticks = static_cast<TickCount>(interval) * s_state.cpu_ticks_per_spu_tick;
-  if (s_state.tick_event.IsActive() && s_state.tick_event.GetInterval() == interval_ticks)
+  const u32 interval = (m_SPUCNT.enable && m_SPUCNT.irq9_enable) ? 1 : max_slice_frames;
+  const TickCount interval_ticks = static_cast<TickCount>(interval) * m_cpu_ticks_per_spu_tick;
+  if (m_tick_event->IsActive() && m_tick_event->GetInterval() == interval_ticks)
     return;
 
-  // Ticks remaining before execution should be retained, just adjust the interval/downcount.
-  const TickCount new_downcount = interval_ticks - s_state.ticks_carry;
-  s_state.tick_event.SetInterval(interval_ticks);
-  s_state.tick_event.Schedule(new_downcount);
+  // Ensure all pending ticks have been executed, since we won't get them back after rescheduling.
+  m_tick_event->InvokeEarly(true);
+  m_tick_event->SetInterval(interval_ticks);
+
+  TickCount downcount = interval_ticks;
+  if (!g_settings.cpu_overclock_active)
+    downcount -= m_ticks_carry;
+
+  m_tick_event->Schedule(downcount);
 }
 
-void SPU::DrawDebugStateWindow(float scale)
+void SPU::DrawDebugStateWindow()
 {
+#ifdef WITH_IMGUI
   static const ImVec4 active_color{1.0f, 1.0f, 1.0f, 1.0f};
   static const ImVec4 inactive_color{0.4f, 0.4f, 0.4f, 1.0f};
+  const float framebuffer_scale = ImGui::GetIO().DisplayFramebufferScale.x;
 
-#ifdef SPU_ENABLE_VU_METER
-  const auto draw_vu_meter = [&scale](s16* peaks) {
-    constexpr s32 num_sections = 12;
-    constexpr s32 amp_per_section = 32767 / num_sections;
-    const s32 lidx = peaks[0] / amp_per_section;
-    const s32 ridx = peaks[1] / amp_per_section;
-
-    const ImVec2 section_size = ImVec2(std::floor(scale * 8.0f), std::floor(scale * 4.0f));
-    const float divider_size = std::floor(scale * 1.0f);
-    ImVec2 left_start = ImGui::GetCursorScreenPos() + ImVec2(0.0f, std::floor(scale * 4.0f));
-    ImVec2 right_start = left_start + ImVec2(0.0f, section_size.y + divider_size);
-    for (s32 i = 0; i < num_sections; i++)
-    {
-      u32 left_color = IM_COL32(30, 30, 30, 255);
-      if (peaks[0] > 0 && lidx >= i)
-      {
-        left_color = IM_COL32(255, 0, 0, 255);
-        left_color = (i <= 8) ? IM_COL32(255, 255, 0, 255) : left_color;
-        left_color = (i <= 6) ? IM_COL32(0, 255, 0, 255) : left_color;
-      }
-      u32 right_color = IM_COL32(30, 30, 30, 255);
-      if (peaks[1] > 0 && ridx >= i)
-      {
-        right_color = IM_COL32(255, 0, 0, 255);
-        right_color = (i <= 8) ? IM_COL32(255, 255, 0, 255) : right_color;
-        right_color = (i <= 6) ? IM_COL32(0, 255, 0, 255) : right_color;
-      }
-
-      ImGui::GetWindowDrawList()->AddRectFilled(left_start, left_start + section_size, left_color);
-      ImGui::GetWindowDrawList()->AddRectFilled(right_start, right_start + section_size, right_color);
-      left_start.x += section_size.x + divider_size;
-      right_start.x += section_size.x + divider_size;
-    }
-
-    peaks[0] = 0;
-    peaks[1] = 0;
-  };
-#endif
+  ImGui::SetNextWindowSize(ImVec2(800.0f * framebuffer_scale, 800.0f * framebuffer_scale), ImGuiCond_FirstUseEver);
+  if (!ImGui::Begin("SPU State", nullptr))
+  {
+    ImGui::End();
+    return;
+  }
 
   // status
   if (ImGui::CollapsingHeader("Status", ImGuiTreeNodeFlags_DefaultOpen))
   {
     static constexpr std::array<const char*, 4> transfer_modes = {
       {"Transfer Stopped", "Manual Write", "DMA Write", "DMA Read"}};
-    const std::array<float, 6> offsets = {
-      {100.0f * scale, 200.0f * scale, 300.0f * scale, 420.0f * scale, 500.0f * scale, 600.0f * scale}};
+    const std::array<float, 6> offsets = {{100.0f * framebuffer_scale, 200.0f * framebuffer_scale,
+                                           300.0f * framebuffer_scale, 420.0f * framebuffer_scale,
+                                           500.0f * framebuffer_scale, 600.0f * framebuffer_scale}};
 
     ImGui::Text("Control: ");
     ImGui::SameLine(offsets[0]);
-    ImGui::TextColored(s_state.SPUCNT.enable ? active_color : inactive_color, "SPU Enable");
+    ImGui::TextColored(m_SPUCNT.enable ? active_color : inactive_color, "SPU Enable");
     ImGui::SameLine(offsets[1]);
-    ImGui::TextColored(s_state.SPUCNT.mute_n ? inactive_color : active_color, "Mute SPU");
+    ImGui::TextColored(m_SPUCNT.mute_n ? inactive_color : active_color, "Mute SPU");
     ImGui::SameLine(offsets[2]);
-    ImGui::TextColored(s_state.SPUCNT.external_audio_enable ? active_color : inactive_color, "External Audio");
+    ImGui::TextColored(m_SPUCNT.external_audio_enable ? active_color : inactive_color, "External Audio");
     ImGui::SameLine(offsets[3]);
-    ImGui::TextColored(s_state.SPUCNT.ram_transfer_mode != RAMTransferMode::Stopped ? active_color : inactive_color,
-                       "%s", transfer_modes[static_cast<u8>(s_state.SPUCNT.ram_transfer_mode.GetValue())]);
+    ImGui::TextColored(m_SPUCNT.ram_transfer_mode != RAMTransferMode::Stopped ? active_color : inactive_color, "%s",
+                       transfer_modes[static_cast<u8>(m_SPUCNT.ram_transfer_mode.GetValue())]);
 
     ImGui::Text("Status: ");
     ImGui::SameLine(offsets[0]);
-    ImGui::TextColored(s_state.SPUSTAT.irq9_flag ? active_color : inactive_color, "IRQ9");
+    ImGui::TextColored(m_SPUSTAT.irq9_flag ? active_color : inactive_color, "IRQ9");
     ImGui::SameLine(offsets[1]);
-    ImGui::TextColored(s_state.SPUSTAT.dma_request ? active_color : inactive_color, "DMA Request");
+    ImGui::TextColored(m_SPUSTAT.dma_request ? active_color : inactive_color, "DMA Request");
     ImGui::SameLine(offsets[2]);
-    ImGui::TextColored(s_state.SPUSTAT.dma_read_request ? active_color : inactive_color, "DMA Read");
+    ImGui::TextColored(m_SPUSTAT.dma_read_request ? active_color : inactive_color, "DMA Read");
     ImGui::SameLine(offsets[3]);
-    ImGui::TextColored(s_state.SPUSTAT.dma_write_request ? active_color : inactive_color, "DMA Write");
+    ImGui::TextColored(m_SPUSTAT.dma_write_request ? active_color : inactive_color, "DMA Write");
     ImGui::SameLine(offsets[4]);
-    ImGui::TextColored(s_state.SPUSTAT.transfer_busy ? active_color : inactive_color, "Transfer Busy");
+    ImGui::TextColored(m_SPUSTAT.transfer_busy ? active_color : inactive_color, "Transfer Busy");
     ImGui::SameLine(offsets[5]);
-    ImGui::TextColored(s_state.SPUSTAT.second_half_capture_buffer ? active_color : inactive_color,
-                       "Second Capture Buffer");
+    ImGui::TextColored(m_SPUSTAT.second_half_capture_buffer ? active_color : inactive_color, "Second Capture Buffer");
 
     ImGui::Text("Interrupt: ");
     ImGui::SameLine(offsets[0]);
-    ImGui::TextColored(s_state.SPUCNT.irq9_enable ? active_color : inactive_color,
-                       s_state.SPUCNT.irq9_enable ? "Enabled @ 0x%04X (actual 0x%08X)" :
-                                                    "Disabled @ 0x%04X (actual 0x%08X)",
-                       s_state.irq_address, (ZeroExtend32(s_state.irq_address) * 8) & RAM_MASK);
+    ImGui::TextColored(m_SPUCNT.irq9_enable ? active_color : inactive_color,
+                       m_SPUCNT.irq9_enable ? "Enabled @ 0x%04X (actual 0x%08X)" : "Disabled @ 0x%04X (actual 0x%08X)",
+                       m_irq_address, (ZeroExtend32(m_irq_address) * 8) & RAM_MASK);
 
     ImGui::Text("Volume: ");
     ImGui::SameLine(offsets[0]);
-    ImGui::Text("Left: %d%%", ApplyVolume(100, s_state.main_volume_left.current_level));
+    ImGui::Text("Left: %d%%", ApplyVolume(100, m_main_volume_left.current_level));
     ImGui::SameLine(offsets[1]);
-    ImGui::Text("Right: %d%%", ApplyVolume(100, s_state.main_volume_right.current_level));
-#ifdef SPU_ENABLE_VU_METER
-    ImGui::SameLine(offsets[2]);
-    draw_vu_meter(s_state.output_peaks);
-    ImGui::NewLine();
-#endif
+    ImGui::Text("Right: %d%%", ApplyVolume(100, m_main_volume_right.current_level));
 
     ImGui::Text("CD Audio: ");
     ImGui::SameLine(offsets[0]);
-    ImGui::TextColored(s_state.SPUCNT.cd_audio_enable ? active_color : inactive_color,
-                       s_state.SPUCNT.cd_audio_enable ? "Enabled" : "Disabled");
+    ImGui::TextColored(m_SPUCNT.cd_audio_enable ? active_color : inactive_color,
+                       m_SPUCNT.cd_audio_enable ? "Enabled" : "Disabled");
     ImGui::SameLine(offsets[1]);
-    ImGui::TextColored(s_state.SPUCNT.cd_audio_enable ? active_color : inactive_color, "Left Volume: %d%%",
-                       ApplyVolume(100, s_state.cd_audio_volume_left));
+    ImGui::TextColored(m_SPUCNT.cd_audio_enable ? active_color : inactive_color, "Left Volume: %d%%",
+                       ApplyVolume(100, m_cd_audio_volume_left));
     ImGui::SameLine(offsets[3]);
-    ImGui::TextColored(s_state.SPUCNT.cd_audio_enable ? active_color : inactive_color, "Right Volume: %d%%",
-                       ApplyVolume(100, s_state.cd_audio_volume_left));
-#ifdef SPU_ENABLE_VU_METER
-    ImGui::SameLine(offsets[5]);
-    draw_vu_meter(s_state.cd_audio_peaks);
-    ImGui::NewLine();
-#endif
+    ImGui::TextColored(m_SPUCNT.cd_audio_enable ? active_color : inactive_color, "Right Volume: %d%%",
+                       ApplyVolume(100, m_cd_audio_volume_left));
 
     ImGui::Text("Transfer FIFO: ");
     ImGui::SameLine(offsets[0]);
-    ImGui::TextColored(s_state.transfer_event.IsActive() ? active_color : inactive_color, "%u halfwords (%u bytes)",
-                       s_state.transfer_fifo.GetSize(), s_state.transfer_fifo.GetSize() * 2);
+    ImGui::TextColored(m_transfer_event->IsActive() ? active_color : inactive_color, "%u halfwords (%u bytes)",
+                       m_transfer_fifo.GetSize(), m_transfer_fifo.GetSize() * 2);
   }
 
   // draw voice states
   if (ImGui::CollapsingHeader("Voice State", ImGuiTreeNodeFlags_DefaultOpen))
   {
-    static constexpr std::array column_titles = {
-      "#",       "StartAddr", "RepeatAddr", "CurAddr", "SampleIdx", "SampleRate",
-      "VolLeft", "VolRight",  "ADSRPhase",  "ADSRVol", "ADSRTicks",
-#ifdef SPU_ENABLE_VU_METER
-      "VUMeter",
-#endif
-    };
-    static constexpr std::array adsr_phases = {"Off", "Attack", "Decay", "Sustain", "Release"};
+    static constexpr u32 NUM_COLUMNS = 12;
 
-    ImGui::Columns(static_cast<int>(column_titles.size()));
+    ImGui::Columns(NUM_COLUMNS);
 
     // headers
-    for (const char* column_title : column_titles)
+    static constexpr std::array<const char*, NUM_COLUMNS> column_titles = {
+      {"#", "InterpIndex", "SampleIndex", "CurAddr", "StartAddr", "RepeatAddr", "SampleRate", "VolLeft", "VolRight",
+       "ADSRPhase", "ADSRVol", "ADSRTicks"}};
+    static constexpr std::array<const char*, 5> adsr_phases = {{"Off", "Attack", "Decay", "Sustain", "Release"}};
+    for (u32 i = 0; i < NUM_COLUMNS; i++)
     {
-      ImGui::TextUnformatted(column_title);
+      ImGui::TextUnformatted(column_titles[i]);
       ImGui::NextColumn();
     }
 
     // states
     for (u32 voice_index = 0; voice_index < NUM_VOICES; voice_index++)
     {
-      const Voice& v = s_state.voices[voice_index];
+      const Voice& v = m_voices[voice_index];
       ImVec4 color = v.IsOn() ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
       ImGui::TextColored(color, "%u", ZeroExtend32(voice_index));
-      ImGui::NextColumn();
-      ImGui::TextColored(color, "%04X", ZeroExtend32(v.regs.adpcm_start_address));
-      ImGui::NextColumn();
-      ImGui::TextColored(color, "%04X", ZeroExtend32(v.regs.adpcm_repeat_address));
-      ImGui::NextColumn();
-      ImGui::TextColored(color, "%04X", ZeroExtend32(v.current_address));
       ImGui::NextColumn();
       if (IsVoiceNoiseEnabled(voice_index))
         ImGui::TextColored(color, "NOISE");
       else
-        ImGui::TextColored(color, "%u", ZeroExtend32(v.counter.sample_index.GetValue()));
+        ImGui::TextColored(color, "%u", ZeroExtend32(v.counter.interpolation_index.GetValue()));
+      ImGui::NextColumn();
+      ImGui::TextColored(color, "%u", ZeroExtend32(v.counter.sample_index.GetValue()));
+      ImGui::NextColumn();
+      ImGui::TextColored(color, "%04X", ZeroExtend32(v.current_address));
+      ImGui::NextColumn();
+      ImGui::TextColored(color, "%04X", ZeroExtend32(v.regs.adpcm_start_address));
+      ImGui::NextColumn();
+      ImGui::TextColored(color, "%04X", ZeroExtend32(v.regs.adpcm_repeat_address));
       ImGui::NextColumn();
       ImGui::TextColored(color, "%.2f", (float(v.regs.adpcm_sample_rate) / 4096.0f) * 44100.0f);
       ImGui::NextColumn();
@@ -2728,10 +1993,6 @@ void SPU::DrawDebugStateWindow(float scale)
       ImGui::NextColumn();
       ImGui::TextColored(color, "%d", v.adsr_envelope.counter);
       ImGui::NextColumn();
-#ifdef SPU_ENABLE_VU_METER
-      draw_vu_meter(s_state.voice_peaks[voice_index]);
-      ImGui::NextColumn();
-#endif
     }
 
     ImGui::Columns(1);
@@ -2739,8 +2000,8 @@ void SPU::DrawDebugStateWindow(float scale)
 
   if (ImGui::CollapsingHeader("Reverb", ImGuiTreeNodeFlags_DefaultOpen))
   {
-    ImGui::TextColored(s_state.SPUCNT.reverb_master_enable ? active_color : inactive_color, "Master Enable: %s",
-                       s_state.SPUCNT.reverb_master_enable ? "Yes" : "No");
+    ImGui::TextColored(m_SPUCNT.reverb_master_enable ? active_color : inactive_color, "Master Enable: %s",
+                       m_SPUCNT.reverb_master_enable ? "Yes" : "No");
     ImGui::Text("Voices Enabled: ");
 
     for (u32 i = 0; i < NUM_VOICES; i++)
@@ -2751,23 +2012,15 @@ void SPU::DrawDebugStateWindow(float scale)
       ImGui::TextColored(active ? active_color : inactive_color, "%u", i);
     }
 
-    ImGui::TextColored(s_state.SPUCNT.cd_audio_reverb ? active_color : inactive_color, "CD Audio Enable: %s",
-                       s_state.SPUCNT.cd_audio_reverb ? "Yes" : "No");
+    ImGui::TextColored(m_SPUCNT.cd_audio_reverb ? active_color : inactive_color, "CD Audio Enable: %s",
+                       m_SPUCNT.cd_audio_reverb ? "Yes" : "No");
 
-    ImGui::TextColored(s_state.SPUCNT.external_audio_reverb ? active_color : inactive_color,
-                       "External Audio Enable: %s", s_state.SPUCNT.external_audio_reverb ? "Yes" : "No");
+    ImGui::TextColored(m_SPUCNT.external_audio_reverb ? active_color : inactive_color, "External Audio Enable: %s",
+                       m_SPUCNT.external_audio_reverb ? "Yes" : "No");
 
-    ImGui::Text("Base Address: 0x%08X (%04X)", s_state.reverb_base_address, s_state.reverb_registers.mBASE);
-    ImGui::Text("Current Address: 0x%08X", s_state.reverb_current_address);
-    ImGui::Text("Current Amplitude: Input (%d, %d) Output (%d, %d)", s_state.last_reverb_input[0],
-                s_state.last_reverb_input[1], s_state.last_reverb_output[0], s_state.last_reverb_output[1]);
-    ImGui::Text("Output Volume: Left %d%% Right %d%%", ApplyVolume(100, s_state.reverb_registers.vLOUT),
-                ApplyVolume(100, s_state.reverb_registers.vROUT));
-#ifdef SPU_ENABLE_VU_METER
-    ImGui::SameLine();
-    draw_vu_meter(s_state.reverb_peaks);
-    ImGui::NewLine();
-#endif
+    ImGui::Text("Current Address: 0x%08X", m_reverb_current_address);
+    ImGui::Text("Current Volume: Input (%d, %d) Output (%d, %d)", s_last_reverb_input[0], s_last_reverb_input[1],
+                s_last_reverb_output[0], s_last_reverb_output[1]);
 
     ImGui::Text("Pitch Modulation: ");
     for (u32 i = 1; i < NUM_VOICES; i++)
@@ -2779,88 +2032,19 @@ void SPU::DrawDebugStateWindow(float scale)
     }
   }
 
-  if (ImGui::CollapsingHeader("Reverb Environment"))
-  {
-    ImGui::Columns(4);
-
-    ImGui::Text("[0] FB_SRC_A: 0x%04X", static_cast<u32>(s_state.reverb_registers.FB_SRC_A));
-    ImGui::NextColumn();
-    ImGui::Text("[1] FB_SRC_B: 0x%04X", static_cast<u32>(s_state.reverb_registers.FB_SRC_B));
-    ImGui::NextColumn();
-    ImGui::Text("[2] IIR_ALPHA: %d", static_cast<s32>(s_state.reverb_registers.IIR_ALPHA));
-    ImGui::NextColumn();
-    ImGui::Text("[3] ACC_COEF_A: %d", static_cast<s32>(s_state.reverb_registers.ACC_COEF_A));
-    ImGui::NextColumn();
-    ImGui::Text("[4] ACC_COEF_B: %d", static_cast<s32>(s_state.reverb_registers.ACC_COEF_B));
-    ImGui::NextColumn();
-    ImGui::Text("[5] ACC_COEF_C: %d", static_cast<s32>(s_state.reverb_registers.ACC_COEF_C));
-    ImGui::NextColumn();
-    ImGui::Text("[6] ACC_COEF_D: %d", static_cast<s32>(s_state.reverb_registers.ACC_COEF_D));
-    ImGui::NextColumn();
-    ImGui::Text("[7] IIR_COEF: %d", static_cast<s32>(s_state.reverb_registers.IIR_COEF));
-    ImGui::NextColumn();
-    ImGui::Text("[8] FB_ALPHA: %d", static_cast<s32>(s_state.reverb_registers.FB_ALPHA));
-    ImGui::NextColumn();
-    ImGui::Text("[9] FB_X: %d", static_cast<s32>(s_state.reverb_registers.FB_X));
-    ImGui::NextColumn();
-    ImGui::Text("[10] IIR_DEST_A[L]: 0x%04X", static_cast<u32>(s_state.reverb_registers.IIR_DEST_A[0]));
-    ImGui::NextColumn();
-    ImGui::Text("[11] IIR_DEST_A[R]: 0x%04X", static_cast<u32>(s_state.reverb_registers.IIR_DEST_A[1]));
-    ImGui::NextColumn();
-    ImGui::Text("[12] ACC_SRC_A[L]: 0x%04X", static_cast<u32>(s_state.reverb_registers.ACC_SRC_A[0]));
-    ImGui::NextColumn();
-    ImGui::Text("[13] ACC_SRC_A[R]: 0x%04X", static_cast<u32>(s_state.reverb_registers.ACC_SRC_A[1]));
-    ImGui::NextColumn();
-    ImGui::Text("[14] ACC_SRC_B[L]: 0x%04X", static_cast<u32>(s_state.reverb_registers.ACC_SRC_B[0]));
-    ImGui::NextColumn();
-    ImGui::Text("[15] ACC_SRC_B[R]: 0x%04X", static_cast<u32>(s_state.reverb_registers.ACC_SRC_B[1]));
-    ImGui::NextColumn();
-    ImGui::Text("[16] IIR_SRC_A[L]: 0x%04X", static_cast<u32>(s_state.reverb_registers.IIR_SRC_A[0]));
-    ImGui::NextColumn();
-    ImGui::Text("[17] IIR_SRC_A[L]: 0x%04X", static_cast<u32>(s_state.reverb_registers.IIR_SRC_A[1]));
-    ImGui::NextColumn();
-    ImGui::Text("[18] IIR_DEST_B[L]: 0x%04X", static_cast<u32>(s_state.reverb_registers.IIR_DEST_B[0]));
-    ImGui::NextColumn();
-    ImGui::Text("[19] IIR_DEST_B[R]: 0x%04X", static_cast<u32>(s_state.reverb_registers.IIR_DEST_B[1]));
-    ImGui::NextColumn();
-    ImGui::Text("[20] ACC_SRC_C[L]: 0x%04X", static_cast<u32>(s_state.reverb_registers.ACC_SRC_C[0]));
-    ImGui::NextColumn();
-    ImGui::Text("[21] ACC_SRC_C[R]: 0x%04X", static_cast<u32>(s_state.reverb_registers.ACC_SRC_C[1]));
-    ImGui::NextColumn();
-    ImGui::Text("[22] ACC_SRC_D[L]: 0x%04X", static_cast<u32>(s_state.reverb_registers.ACC_SRC_D[0]));
-    ImGui::NextColumn();
-    ImGui::Text("[23] ACC_SRC_D[R]: 0x%04X", static_cast<u32>(s_state.reverb_registers.ACC_SRC_D[1]));
-    ImGui::NextColumn();
-    ImGui::Text("[24] IIR_SRC_B[L]: 0x%04X", static_cast<u32>(s_state.reverb_registers.IIR_SRC_B[0]));
-    ImGui::NextColumn();
-    ImGui::Text("[25] IIR_SRC_B[R]: 0x%04X", static_cast<u32>(s_state.reverb_registers.IIR_SRC_B[1]));
-    ImGui::NextColumn();
-    ImGui::Text("[26] MIX_DEST_A[L]: 0x%04X", static_cast<u32>(s_state.reverb_registers.MIX_DEST_A[0]));
-    ImGui::NextColumn();
-    ImGui::Text("[27] MIX_DEST_A[R]: 0x%04X", static_cast<u32>(s_state.reverb_registers.MIX_DEST_A[1]));
-    ImGui::NextColumn();
-    ImGui::Text("[28] MIX_DEST_B[L]: 0x%04X", static_cast<u32>(s_state.reverb_registers.MIX_DEST_B[0]));
-    ImGui::NextColumn();
-    ImGui::Text("[29] MIX_DEST_B[R]: 0x%04X", static_cast<u32>(s_state.reverb_registers.MIX_DEST_B[1]));
-    ImGui::NextColumn();
-    ImGui::Text("[30] IIR_SRC_A[L]: %d", static_cast<u32>(s_state.reverb_registers.IN_COEF[0]));
-    ImGui::NextColumn();
-    ImGui::Text("[31] IIR_SRC_A[R]: %d", static_cast<u32>(s_state.reverb_registers.IN_COEF[1]));
-    ImGui::NextColumn();
-
-    ImGui::Columns(1);
-  }
-
   if (ImGui::CollapsingHeader("Hacks", ImGuiTreeNodeFlags_DefaultOpen))
   {
     if (ImGui::Button("Key Off All Voices"))
     {
       for (u32 i = 0; i < NUM_VOICES; i++)
       {
-        s_state.voices[i].KeyOff();
-        s_state.voices[i].adsr_envelope.counter = 0;
-        s_state.voices[i].regs.adsr_volume = 0;
+        m_voices[i].KeyOff();
+        m_voices[i].adsr_envelope.counter = 0;
+        m_voices[i].regs.adsr_volume = 0;
       }
     }
   }
+
+  ImGui::End();
+#endif
 }

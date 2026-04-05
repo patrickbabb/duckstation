@@ -1,8 +1,4 @@
-// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #pragma once
-#include "heterogeneous_containers.h"
 #include <cstdint>
 #include <map>
 
@@ -17,13 +13,10 @@ class LRUCache
     CounterType last_access;
   };
 
-  using MapType = std::conditional_t<std::is_same_v<K, std::string>, StringMap<Item>, std::map<K, Item>>;
+  using MapType = std::map<K, Item>;
 
 public:
-  LRUCache(std::size_t max_capacity = 16, bool manual_evict = false)
-    : m_max_capacity(max_capacity), m_manual_evict(manual_evict)
-  {
-  }
+  LRUCache(std::size_t max_capacity = 16) : m_max_capacity(max_capacity) {}
   ~LRUCache() = default;
 
   std::size_t GetSize() const { return m_items.size(); }
@@ -38,8 +31,7 @@ public:
       Evict(m_items.size() - m_max_capacity);
   }
 
-  template<typename KeyT>
-  V* Lookup(const KeyT& key)
+  V* Lookup(const K& key)
   {
     auto iter = m_items.find(key);
     if (iter == m_items.end())
@@ -49,7 +41,7 @@ public:
     return &iter->second.value;
   }
 
-  V* Insert(K key, V value)
+  V* Insert(const K& key, V value)
   {
     ShrinkForNewItem();
 
@@ -65,14 +57,14 @@ public:
       Item it;
       it.last_access = ++m_last_counter;
       it.value = std::move(value);
-      auto ip = m_items.emplace(std::move(key), std::move(it));
+      auto ip = m_items.emplace(key, std::move(it));
       return &ip.first->second.value;
     }
   }
 
   void Evict(std::size_t count = 1)
   {
-    while (!m_items.empty() && count > 0)
+    while (m_items.size() >= count)
     {
       typename MapType::iterator lowest = m_items.end();
       for (auto iter = m_items.begin(); iter != m_items.end(); ++iter)
@@ -81,56 +73,17 @@ public:
           lowest = iter;
       }
       m_items.erase(lowest);
-      count--;
     }
   }
 
-  template<typename Pred>
-  std::size_t RemoveMatchingItems(const Pred& pred)
-  {
-    std::size_t removed_count = 0;
-    for (auto iter = m_items.begin(); iter != m_items.end();)
-    {
-      if (pred(iter->first))
-      {
-        iter = m_items.erase(iter);
-        removed_count++;
-      }
-      else
-      {
-        ++iter;
-      }
-    }
-    return removed_count;
-  }
-
-  template<typename KeyT>
-  bool Remove(const KeyT& key)
+  bool Remove(const K& key)
   {
     auto iter = m_items.find(key);
     if (iter == m_items.end())
       return false;
+
     m_items.erase(iter);
     return true;
-  }
-  void SetManualEvict(bool block)
-  {
-    m_manual_evict = block;
-    if (!m_manual_evict)
-      ManualEvict();
-  }
-  void ManualEvict()
-  {
-    // evict if we went over
-    while (m_items.size() > m_max_capacity)
-      Evict(m_items.size() - m_max_capacity);
-  }
-
-  template<typename F>
-  void Apply(const F& func)
-  {
-    for (auto& [key, value] : m_items)
-      func(const_cast<const K&>(key), value.value);
   }
 
 private:
@@ -145,5 +98,4 @@ private:
   MapType m_items;
   CounterType m_last_counter = 0;
   std::size_t m_max_capacity = 0;
-  bool m_manual_evict = false;
 };

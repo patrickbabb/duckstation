@@ -6,15 +6,12 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>1270</width>
+    <width>1210</width>
     <height>800</height>
    </rect>
   </property>
   <property name="windowTitle">
    <string>CPU Debugger</string>
-  </property>
-  <property name="windowIcon">
-   <iconset theme="code-line"/>
   </property>
   <property name="dockNestingEnabled">
    <bool>true</bool>
@@ -25,8 +22,8 @@
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>1270</width>
-     <height>33</height>
+     <width>1210</width>
+     <height>21</height>
     </rect>
    </property>
    <widget class="QMenu" name="menu_Debugger">
@@ -39,14 +36,15 @@
     <addaction name="actionGoToPC"/>
     <addaction name="actionGoToAddress"/>
     <addaction name="actionDumpAddress"/>
-    <addaction name="separator"/>
-    <addaction name="actionTrace"/>
+    <addaction name="separator"/>    
+    <addaction name="actionTrace"/>    
     <addaction name="separator"/>
     <addaction name="actionStepInto"/>
     <addaction name="actionStepOver"/>
     <addaction name="actionStepOut"/>
     <addaction name="separator"/>
     <addaction name="actionClose"/>
+
    </widget>
    <widget class="QMenu" name="menuBreakpoints">
     <property name="title">
@@ -84,12 +82,12 @@
    <addaction name="actionStepInto"/>
    <addaction name="actionStepOver"/>
    <addaction name="actionStepOut"/>
-   <addaction name="separator"/>
+   <addaction name="separator"/>   
    <addaction name="actionTrace"/>
   </widget>
   <widget class="QDockWidget" name="dockWidget_2">
    <property name="features">
-    <set>QDockWidget::DockWidgetFeature::DockWidgetFloatable|QDockWidget::DockWidgetFeature::DockWidgetMovable</set>
+    <set>QDockWidget::DockWidgetFloatable|QDockWidget::DockWidgetMovable</set>
    </property>
    <property name="windowTitle">
     <string>Disassembly</string>
@@ -97,18 +95,21 @@
    <attribute name="dockWidgetArea">
     <number>4</number>
    </attribute>
-   <widget class="DebuggerCodeView" name="codeView">
+   <widget class="QTreeView" name="codeView">
     <property name="sizePolicy">
      <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
       <horstretch>0</horstretch>
       <verstretch>0</verstretch>
      </sizepolicy>
     </property>
+    <attribute name="headerVisible">
+     <bool>false</bool>
+    </attribute>
    </widget>
   </widget>
   <widget class="QDockWidget" name="dockWidget_3">
    <property name="features">
-    <set>QDockWidget::DockWidgetFeature::DockWidgetFloatable|QDockWidget::DockWidgetFeature::DockWidgetMovable</set>
+    <set>QDockWidget::DockWidgetFloatable|QDockWidget::DockWidgetMovable</set>
    </property>
    <property name="windowTitle">
     <string>Registers</string>
@@ -139,7 +140,7 @@
     </sizepolicy>
    </property>
    <property name="features">
-    <set>QDockWidget::DockWidgetFeature::DockWidgetFloatable|QDockWidget::DockWidgetFeature::DockWidgetMovable</set>
+    <set>QDockWidget::DockWidgetFloatable|QDockWidget::DockWidgetMovable</set>
    </property>
    <property name="windowTitle">
     <string>Memory</string>
@@ -195,7 +196,7 @@
        <item>
         <spacer name="horizontalSpacer">
          <property name="orientation">
-          <enum>Qt::Orientation::Horizontal</enum>
+          <enum>Qt::Horizontal</enum>
          </property>
          <property name="sizeHint" stdset="0">
           <size>
@@ -233,12 +234,12 @@
    </property>
    <property name="maximumSize">
     <size>
-     <width>290</width>
+     <width>200</width>
      <height>524287</height>
     </size>
    </property>
    <property name="features">
-    <set>QDockWidget::DockWidgetFeature::DockWidgetFloatable|QDockWidget::DockWidgetFeature::DockWidgetMovable</set>
+    <set>QDockWidget::DockWidgetFloatable|QDockWidget::DockWidgetMovable</set>
    </property>
    <property name="windowTitle">
     <string>Breakpoints</string>
@@ -248,10 +249,10 @@
    </attribute>
    <widget class="QTreeWidget" name="breakpointsWidget">
     <property name="selectionMode">
-     <enum>QAbstractItemView::SelectionMode::SingleSelection</enum>
+     <enum>QAbstractItemView::SingleSelection</enum>
     </property>
     <property name="selectionBehavior">
-     <enum>QAbstractItemView::SelectionBehavior::SelectRows</enum>
+     <enum>QAbstractItemView::SelectRows</enum>
     </property>
     <property name="sortingEnabled">
      <bool>true</bool>
@@ -271,11 +272,6 @@
     </column>
     <column>
      <property name="text">
-      <string>Type</string>
-     </property>
-    </column>
-    <column>
-     <property name="text">
       <string>Hit Count</string>
      </property>
     </column>
@@ -283,7 +279,7 @@
   </widget>
   <widget class="QDockWidget" name="dockWidget_4">
    <property name="features">
-    <set>QDockWidget::DockWidgetFeature::DockWidgetFloatable|QDockWidget::DockWidgetFeature::DockWidgetMovable</set>
+    <set>QDockWidget::DockWidgetFloatable|QDockWidget::DockWidgetMovable</set>
    </property>
    <property name="windowTitle">
     <string>Stack</string>
@@ -305,13 +301,14 @@
     <bool>true</bool>
    </property>
    <property name="icon">
-    <iconset theme="pause-line"/>
+    <iconset resource="resources/resources.qrc">
+     <normaloff>:/icons/media-playback-pause.png</normaloff>:/icons/media-playback-pause.png</iconset>
    </property>
    <property name="text">
-    <string>&amp;Pause/Continue</string>
+    <string>Pause/Continue</string>
    </property>
    <property name="toolTip">
-    <string>Pause/Continue</string>
+    <string>&amp;Pause/Continue</string>
    </property>
    <property name="shortcut">
     <string>F5</string>
@@ -319,13 +316,14 @@
   </action>
   <action name="actionStepInto">
    <property name="icon">
-    <iconset theme="debug-step-into-line"/>
+    <iconset resource="resources/resources.qrc">
+     <normaloff>:/icons/debug-step-into-instruction.png</normaloff>:/icons/debug-step-into-instruction.png</iconset>
    </property>
    <property name="text">
-    <string>&amp;Step Into</string>
+    <string>Step Into</string>
    </property>
    <property name="toolTip">
-    <string>Step Into</string>
+    <string>&amp;Step Into</string>
    </property>
    <property name="shortcut">
     <string>F11</string>
@@ -333,13 +331,14 @@
   </action>
   <action name="actionStepOver">
    <property name="icon">
-    <iconset theme="debug-step-over-line"/>
+    <iconset resource="resources/resources.qrc">
+     <normaloff>:/icons/debug-step-over.png</normaloff>:/icons/debug-step-over.png</iconset>
    </property>
    <property name="text">
-    <string>Step &amp;Over</string>
+    <string>Step Over</string>
    </property>
    <property name="toolTip">
-    <string>Step Over</string>
+    <string>Step &amp;Over</string>
    </property>
    <property name="shortcut">
     <string>F10</string>
@@ -347,13 +346,14 @@
   </action>
   <action name="actionToggleBreakpoint">
    <property name="icon">
-    <iconset theme="debug-toggle-breakpoint"/>
+    <iconset resource="resources/resources.qrc">
+     <normaloff>:/icons/media-record@2x.png</normaloff>:/icons/media-record@2x.png</iconset>
    </property>
    <property name="text">
-    <string>Toggle &amp;Breakpoint</string>
+    <string>Toggle Breakpoint</string>
    </property>
    <property name="toolTip">
-    <string>Toggle Breakpoint</string>
+    <string>Toggle &amp;Breakpoint</string>
    </property>
    <property name="shortcut">
     <string>F9</string>
@@ -366,13 +366,14 @@
   </action>
   <action name="actionStepOut">
    <property name="icon">
-    <iconset theme="debug-step-out-line"/>
+    <iconset resource="resources/resources.qrc">
+     <normaloff>:/icons/debug-step-out.png</normaloff>:/icons/debug-step-out.png</iconset>
    </property>
    <property name="text">
-    <string>Step O&amp;ut</string>
+    <string>Step Out</string>
    </property>
    <property name="toolTip">
-    <string>Step Out</string>
+    <string>Step O&amp;ut</string>
    </property>
    <property name="shortcut">
     <string>Ctrl+F11</string>
@@ -380,13 +381,14 @@
   </action>
   <action name="actionRunToCursor">
    <property name="icon">
-    <iconset theme="debugger-go-to-cursor"/>
+    <iconset resource="resources/resources.qrc">
+     <normaloff>:/icons/debug-run-cursor.png</normaloff>:/icons/debug-run-cursor.png</iconset>
    </property>
    <property name="text">
-    <string>&amp;Run To Cursor</string>
+    <string>Run To Cursor</string>
    </property>
    <property name="toolTip">
-    <string>Run To Cursor</string>
+    <string>&amp;Run To Cursor</string>
    </property>
    <property name="shortcut">
     <string>Ctrl+F10</string>
@@ -394,13 +396,14 @@
   </action>
   <action name="actionClearBreakpoints">
    <property name="icon">
-    <iconset theme="debugger-clear-breakpoint"/>
+    <iconset resource="resources/resources.qrc">
+     <normaloff>:/icons/edit-clear-16.png</normaloff>:/icons/edit-clear-16.png</iconset>
    </property>
    <property name="text">
-    <string>&amp;Clear Breakpoints</string>
+    <string>Clear Breakpoints</string>
    </property>
    <property name="toolTip">
-    <string>Clear Breakpoints</string>
+    <string>&amp;Clear Breakpoints</string>
    </property>
    <property name="shortcut">
     <string>Ctrl+Del</string>
@@ -408,13 +411,14 @@
   </action>
   <action name="actionAddBreakpoint">
    <property name="icon">
-    <iconset theme="add-line"/>
+    <iconset resource="resources/resources.qrc">
+     <normaloff>:/icons/list-add.png</normaloff>:/icons/list-add.png</iconset>
    </property>
    <property name="text">
-    <string>&amp;Add Breakpoint</string>
+    <string>Add Breakpoint</string>
    </property>
    <property name="toolTip">
-    <string>Add Breakpoint</string>
+    <string>Add &amp;Breakpoint</string>
    </property>
    <property name="shortcut">
     <string>Ctrl+F9</string>
@@ -422,13 +426,14 @@
   </action>
   <action name="actionGoToPC">
    <property name="icon">
-    <iconset theme="debugger-go-to-pc"/>
+    <iconset resource="resources/resources.qrc">
+     <normaloff>:/icons/document-open.png</normaloff>:/icons/document-open.png</iconset>
    </property>
    <property name="text">
-    <string>&amp;Go To PC</string>
+    <string>Go To PC</string>
    </property>
    <property name="toolTip">
-    <string>Go To PC</string>
+    <string>&amp;Go To PC</string>
    </property>
    <property name="shortcut">
     <string>Ctrl+P</string>
@@ -436,13 +441,14 @@
   </action>
   <action name="actionGoToAddress">
    <property name="icon">
-    <iconset theme="debugger-go-to-address"/>
+    <iconset resource="resources/resources.qrc">
+     <normaloff>:/icons/applications-system.png</normaloff>:/icons/applications-system.png</iconset>
    </property>
    <property name="text">
-    <string>Go To &amp;Address</string>
+    <string>Go To Address</string>
    </property>
    <property name="toolTip">
-    <string>Go To Address</string>
+    <string>Go To &amp;Address</string>
    </property>
    <property name="shortcut">
     <string>Ctrl+G</string>
@@ -450,7 +456,8 @@
   </action>
   <action name="actionDumpAddress">
    <property name="icon">
-    <iconset theme="debugger-dump-address"/>
+    <iconset resource="resources/resources.qrc">
+     <normaloff>:/icons/antialias-icon.png</normaloff>:/icons/antialias-icon.png</iconset>
    </property>
    <property name="text">
     <string>&amp;Dump Address</string>
@@ -461,18 +468,21 @@
   </action>
   <action name="actionTrace">
    <property name="icon">
-    <iconset theme="debug-trace-line"/>
+    <iconset resource="resources/resources.qrc">
+     <normaloff>:/icons/debug-trace.png</normaloff>:/icons/debug-trace.png</iconset>
    </property>
    <property name="text">
-    <string>&amp;Trace</string>
+    <string>Trace</string>
    </property>
    <property name="toolTip">
-    <string>Trace</string>
+    <string>&amp;Trace</string>
    </property>
    <property name="shortcut">
     <string>Ctrl+T</string>
    </property>
   </action>
+  
+  
  </widget>
  <customwidgets>
   <customwidget>
@@ -481,15 +491,9 @@
    <header>duckstation-qt/memoryviewwidget.h</header>
    <container>1</container>
   </customwidget>
-  <customwidget>
-   <class>DebuggerCodeView</class>
-   <extends>QAbstractScrollArea</extends>
-   <header>duckstation-qt/debuggercodeview.h</header>
-   <container>1</container>
-  </customwidget>
  </customwidgets>
  <resources>
-  <include location="resources/duckstation-qt.qrc"/>
+  <include location="resources/resources.qrc"/>
  </resources>
  <connections/>
 </ui>

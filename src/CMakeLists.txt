@@ -1,23 +1,31 @@
+if(BUILD_LIBRETRO_CORE)
+  add_definitions("-DLIBRETRO=1")
+endif()
+
 add_subdirectory(common)
-add_subdirectory(util)
 add_subdirectory(core)
 add_subdirectory(scmversion)
-add_subdirectory(duckstation-qt)
 
-if(WIN32 OR APPLE)
-  add_subdirectory(updater)
+if(NOT BUILD_LIBRETRO_CORE)
+  add_subdirectory(frontend-common)
 endif()
 
-if(WIN32)
-  add_subdirectory(installer)
-  add_subdirectory(uninstaller)
+if(NOT BUILD_LIBRETRO_CORE AND NOT ANDROID)
+  add_subdirectory(common-tests)
+  if(WIN32)
+    add_subdirectory(updater)
+  endif()
 endif()
 
-if(BUILD_REGTEST)
-  add_subdirectory(duckstation-regtest)
+if(BUILD_NOGUI_FRONTEND)
+  add_subdirectory(duckstation-nogui)
 endif()
 
-if(BUILD_TESTS)
-  add_subdirectory(common-tests EXCLUDE_FROM_ALL)
-  add_subdirectory(util-tests EXCLUDE_FROM_ALL)
+if(BUILD_QT_FRONTEND)
+  add_subdirectory(duckstation-qt)
 endif()
+
+if(BUILD_LIBRETRO_CORE)
+  add_subdirectory(duckstation-libretro)
+endif()
+

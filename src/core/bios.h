@@ -1,21 +1,9 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>.
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #pragma once
-
 #include "types.h"
-
-#include "common/heap_array.h"
-#include "common/small_string.h"
-
-#include <array>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
-
-class Error;
 
 namespace BIOS {
 enum : u32
@@ -26,36 +14,24 @@ enum : u32
   BIOS_SIZE_PS3 = 0x3E66F0
 };
 
-struct ImageInfo
+using Image = std::vector<u8>;
+
+struct Hash
 {
-  static constexpr u32 HASH_SIZE = 16;
-  using Hash = std::array<u8, HASH_SIZE>;
+  u8 bytes[16];
 
-  enum class FastBootPatch : u8
-  {
-    Unsupported,
-    Type1,
-    Type2,
-  };
+  ALWAYS_INLINE bool operator==(const Hash& bh) const { return (std::memcmp(bytes, bh.bytes, sizeof(bytes)) == 0); }
+  ALWAYS_INLINE bool operator!=(const Hash& bh) const { return (std::memcmp(bytes, bh.bytes, sizeof(bytes)) != 0); }
 
-  const char* description;
-  ConsoleRegion region;
-  bool region_check;
-  FastBootPatch fastboot_patch;
-  u8 priority;
-  alignas(16) Hash hash;
-
-  bool SupportsFastBoot() const { return (fastboot_patch != FastBootPatch::Unsupported); }
-  bool CanSlowBootDisc(DiscRegion disc_region) const;
-
-  static TinyString GetHashString(const Hash& hash);
+  std::string ToString() const;
 };
 
-struct Image
+struct ImageInfo
 {
-  const ImageInfo* info;
-  ImageInfo::Hash hash;
-  DynamicHeapArray<u8> data;
+  const char* description;
+  ConsoleRegion region;
+  Hash hash;
+  bool patch_compatible;
 };
 
 #pragma pack(push, 1)
@@ -79,30 +55,19 @@ struct PSEXEHeader
 static_assert(sizeof(PSEXEHeader) == 0x800);
 #pragma pack(pop)
 
-// .cpe files
-inline constexpr u32 CPE_MAGIC = 0x01455043;
+Hash GetHash(const Image& image);
+std::optional<Image> LoadImageFromFile(const char* filename);
+std::optional<Hash> GetHashForFile(const char* filename);
 
-std::optional<Image> LoadImageFromFile(const char* filename, Error* error);
+const ImageInfo* GetImageInfoForHash(const Hash& hash);
+bool IsValidHashForRegion(ConsoleRegion region, const Hash& hash);
 
-const ImageInfo* GetInfoForHash(const std::span<const u8> image, const ImageInfo::Hash& hash);
+void PatchBIOS(u8* image, u32 image_size, u32 address, u32 value, u32 mask = UINT32_C(0xFFFFFFFF));
 
-bool IsValidBIOSForRegion(ConsoleRegion console_region, ConsoleRegion bios_region);
+bool PatchBIOSEnableTTY(u8* image, u32 image_size, const Hash& hash);
+bool PatchBIOSFastBoot(u8* image, u32 image_size, const Hash& hash);
+bool PatchBIOSForEXE(u8* image, u32 image_size, u32 r_pc, u32 r_gp, u32 r_sp, u32 r_fp);
 
-bool PatchBIOSFastBoot(u8* image, u32 image_size, ImageInfo::FastBootPatch type);
-
-bool IsValidPSExeHeader(const PSEXEHeader& header, size_t file_size);
+bool IsValidPSExeHeader(const PSEXEHeader& header, u32 file_size);
 DiscRegion GetPSExeDiscRegion(const PSEXEHeader& header);
-
-/// Loads the BIOS image for the specified region.
-std::optional<Image> GetBIOSImage(ConsoleRegion region, Error* error);
-
-/// Searches for a BIOS image for the specified region in the specified directory. If no match is found, the first
-/// BIOS image within 512KB and 4MB will be used.
-std::optional<Image> FindBIOSImageInDirectory(ConsoleRegion region, const char* directory, Error* error);
-
-/// Returns a list of filenames and descriptions for BIOS images in a directory.
-std::vector<std::pair<std::string, const BIOS::ImageInfo*>> FindBIOSImagesInDirectory(const char* directory);
-
-/// Returns true if any BIOS images are found in the configured BIOS directory.
-bool HasAnyBIOSImages();
 } // namespace BIOS

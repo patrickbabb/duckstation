@@ -1,29 +1,18 @@
-// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #include "playstation_mouse.h"
-#include "gpu.h"
-#include "system.h"
-
-#include "util/state_wrapper.h"
-#include "util/translation.h"
-
 #include "common/assert.h"
 #include "common/log.h"
-#include "common/settings_interface.h"
-
-#include "IconsPromptFont.h"
-
+#include "common/state_wrapper.h"
+#include "gpu.h"
+#include "host_display.h"
+#include "host_interface.h"
+#include "system.h"
 #include <array>
-#include <cmath>
+Log_SetChannel(PlayStationMouse);
 
-LOG_CHANNEL(Controller);
-
-static constexpr std::array<u8, static_cast<size_t>(PlayStationMouse::Binding::ButtonCount)> s_button_indices = {
-  {11, 10}};
-
-PlayStationMouse::PlayStationMouse(u32 index) : Controller(index)
+PlayStationMouse::PlayStationMouse()
 {
+  m_last_host_position_x = g_host_interface->GetDisplay()->GetMousePositionX();
+  m_last_host_position_y = g_host_interface->GetDisplay()->GetMousePositionY();
 }
 
 PlayStationMouse::~PlayStationMouse() = default;
@@ -31,6 +20,16 @@ PlayStationMouse::~PlayStationMouse() = default;
 ControllerType PlayStationMouse::GetType() const
 {
   return ControllerType::PlayStationMouse;
+}
+
+std::optional<s32> PlayStationMouse::GetAxisCodeByName(std::string_view axis_name) const
+{
+  return StaticGetAxisCodeByName(axis_name);
+}
+
+std::optional<s32> PlayStationMouse::GetButtonCodeByName(std::string_view button_name) const
+{
+  return StaticGetButtonCodeByName(button_name);
 }
 
 void PlayStationMouse::Reset()
@@ -44,21 +43,11 @@ bool PlayStationMouse::DoState(StateWrapper& sw, bool apply_input_state)
     return false;
 
   u16 button_state = m_button_state;
-  float delta_x = m_delta_x;
-  float delta_y = m_delta_y;
+  u8 delta_x = m_delta_x;
+  u8 delta_y = m_delta_y;
   sw.Do(&button_state);
-  if (sw.GetVersion() >= 60) [[unlikely]]
-  {
-    sw.Do(&delta_x);
-    sw.Do(&delta_y);
-  }
-  else
-  {
-    u8 dummy = 0;
-    sw.Do(&dummy);
-    sw.Do(&dummy);
-  }
-
+  sw.Do(&delta_x);
+  sw.Do(&delta_y);
   if (apply_input_state)
   {
     m_button_state = button_state;
@@ -70,31 +59,30 @@ bool PlayStationMouse::DoState(StateWrapper& sw, bool apply_input_state)
   return true;
 }
 
-float PlayStationMouse::GetBindState(u32 index) const
+bool PlayStationMouse::GetButtonState(s32 button_code) const
 {
-  if (index >= s_button_indices.size())
-    return 0.0f;
+  if (button_code < 0 || button_code >= static_cast<s32>(Button::Count))
+    return false;
 
-  const u32 bit = s_button_indices[index];
-  return static_cast<float>(((m_button_state >> bit) & 1u) ^ 1u);
+  const u16 bit = u16(1) << static_cast<u8>(button_code);
+  return ((m_button_state & bit) == 0);
 }
 
-void PlayStationMouse::SetBindState(u32 index, float value)
+void PlayStationMouse::SetButtonState(Button button, bool pressed)
 {
-  if (index >= s_button_indices.size())
-  {
-    if (index == static_cast<u32>(Binding::PointerX))
-      m_delta_x += value;
-    else if (index == static_cast<u32>(Binding::PointerY))
-      m_delta_y += value;
-
-    return;
-  }
-
-  if (value >= 0.5f)
-    m_button_state &= ~(u16(1) << s_button_indices[index]);
+  static constexpr std::array<u8, static_cast<size_t>(Button::Count)> indices = {{11, 10}};
+  if (pressed)
+    m_button_state &= ~(u16(1) << indices[static_cast<u8>(button)]);
   else
-    m_button_state |= u16(1) << s_button_indices[index];
+    m_button_state |= u16(1) << indices[static_cast<u8>(button)];
+}
+
+void PlayStationMouse::SetButtonState(s32 button_code, bool pressed)
+{
+  if (button_code < 0 || button_code >= static_cast<s32>(Button::Count))
+    return;
+
+  SetButtonState(static_cast<Button>(button_code), pressed);
 }
 
 void PlayStationMouse::ResetTransferState()
@@ -156,20 +144,15 @@ bool PlayStationMouse::Transfer(const u8 data_in, u8* data_out)
 
     case TransferState::DeltaX:
     {
-      const float delta_x = std::floor(m_delta_x * m_sensitivity_x);
-      m_delta_x -= delta_x / m_sensitivity_x;
-      *data_out = static_cast<s8>(std::clamp(delta_x, static_cast<float>(std::numeric_limits<s8>::min()),
-                                             static_cast<float>(std::numeric_limits<s8>::max())));
+      UpdatePosition();
+      *data_out = static_cast<u8>(m_delta_x);
       m_transfer_state = TransferState::DeltaY;
       return true;
     }
 
     case TransferState::DeltaY:
     {
-      const float delta_y = std::floor(m_delta_y * m_sensitivity_y);
-      m_delta_y -= delta_y / m_sensitivity_x;
-      *data_out = static_cast<s8>(std::clamp(delta_y, static_cast<float>(std::numeric_limits<s8>::min()),
-                                             static_cast<float>(std::numeric_limits<s8>::max())));
+      *data_out = static_cast<u8>(m_delta_y);
       m_transfer_state = TransferState::Idle;
       return false;
     }
@@ -177,47 +160,90 @@ bool PlayStationMouse::Transfer(const u8 data_in, u8* data_out)
     default:
     {
       UnreachableCode();
+      return false;
     }
   }
 }
 
-void PlayStationMouse::LoadSettings(const SettingsInterface& si, const char* section, bool initial)
+void PlayStationMouse::UpdatePosition()
 {
-  Controller::LoadSettings(si, section, initial);
+  // get screen coordinates
+  const HostDisplay* display = g_host_interface->GetDisplay();
+  const s32 mouse_x = display->GetMousePositionX();
+  const s32 mouse_y = display->GetMousePositionY();
+  const s32 delta_x = mouse_x - m_last_host_position_x;
+  const s32 delta_y = mouse_y - m_last_host_position_y;
+  m_last_host_position_x = mouse_x;
+  m_last_host_position_y = mouse_y;
 
-  m_sensitivity_x = si.GetFloatValue(section, "SensitivityX", 1.0f);
-  m_sensitivity_y = si.GetFloatValue(section, "SensitivityY", 1.0f);
+  if (delta_x != 0 || delta_y != 0)
+    Log_DevPrintf("dx=%d, dy=%d", delta_x, delta_y);
+
+  m_delta_x = static_cast<s8>(std::clamp<s32>(delta_x, std::numeric_limits<s8>::min(), std::numeric_limits<s8>::max()));
+  m_delta_y = static_cast<s8>(std::clamp<s32>(delta_y, std::numeric_limits<s8>::min(), std::numeric_limits<s8>::max()));
 }
 
-std::unique_ptr<PlayStationMouse> PlayStationMouse::Create(u32 index)
+std::unique_ptr<PlayStationMouse> PlayStationMouse::Create()
 {
-  return std::make_unique<PlayStationMouse>(index);
+  return std::make_unique<PlayStationMouse>();
 }
 
-static const Controller::ControllerBindingInfo s_binding_info[] = {
-#define BUTTON(name, display_name, icon_name, button, genb)                                                            \
-  {name, display_name, icon_name, static_cast<u32>(button), InputBindingInfo::Type::Button, genb}
+std::optional<s32> PlayStationMouse::StaticGetAxisCodeByName(std::string_view button_name)
+{
+  return std::nullopt;
+}
 
-  // clang-format off
-  { "Pointer", TRANSLATE_NOOP("PlaystationMouse", "Pointer"), ICON_PF_MOUSE_ANY, static_cast<u32>(PlayStationMouse::Binding::PointerX), InputBindingInfo::Type::RelativePointer, GenericInputBinding::Unknown },
-  BUTTON("Left", TRANSLATE_NOOP("PlayStationMouse", "Left Button"), ICON_PF_MOUSE_BUTTON_1, PlayStationMouse::Binding::Left, GenericInputBinding::Cross),
-  BUTTON("Right", TRANSLATE_NOOP("PlayStationMouse", "Right Button"), ICON_PF_MOUSE_BUTTON_2, PlayStationMouse::Binding::Right, GenericInputBinding::Circle),
-// clang-format on
+std::optional<s32> PlayStationMouse::StaticGetButtonCodeByName(std::string_view button_name)
+{
+#define BUTTON(name)                                                                                                   \
+  if (button_name == #name)                                                                                            \
+  {                                                                                                                    \
+    return static_cast<s32>(ZeroExtend32(static_cast<u8>(Button::name)));                                              \
+  }
+
+  BUTTON(Left);
+  BUTTON(Right);
+
+  return std::nullopt;
 
 #undef BUTTON
-};
-static const SettingInfo s_settings[] = {
-  {SettingInfo::Type::Float, "SensitivityX", TRANSLATE_NOOP("PlayStationMouse", "Horizontal Sensitivity"),
-   TRANSLATE_NOOP("PlayStationMouse", "Adjusts the correspondance between physical and virtual mouse movement."), "1",
-   "0.01", "2", "0.01", "%.0f", nullptr, 100.0f},
-  {SettingInfo::Type::Float, "SensitivityY", TRANSLATE_NOOP("PlayStationMouse", "Vertical Sensitivity"),
-   TRANSLATE_NOOP("PlayStationMouse", "Adjusts the correspondance between physical and virtual mouse movement."), "1",
-   "0.01", "2", "0.01", "%.0f", nullptr, 100.0f},
-};
+}
 
-const Controller::ControllerInfo PlayStationMouse::INFO = {ControllerType::PlayStationMouse,
-                                                           "PlayStationMouse",
-                                                           TRANSLATE_NOOP("ControllerType", "Mouse"),
-                                                           ICON_PF_MOUSE,
-                                                           s_binding_info,
-                                                           s_settings};
+Controller::AxisList PlayStationMouse::StaticGetAxisNames()
+{
+  return {};
+}
+
+Controller::ButtonList PlayStationMouse::StaticGetButtonNames()
+{
+  return {{TRANSLATABLE("PlayStationMouse", "Left"), static_cast<s32>(Button::Left)},
+          {TRANSLATABLE("PlayStationMouse", "Right"), static_cast<s32>(Button::Right)}};
+}
+
+u32 PlayStationMouse::StaticGetVibrationMotorCount()
+{
+  return 0;
+}
+
+Controller::SettingList PlayStationMouse::StaticGetSettings()
+{
+  static constexpr std::array<SettingInfo, 1> settings = {{
+    {SettingInfo::Type::Boolean, "RelativeMouseMode", TRANSLATABLE("PlayStationMouse", "Relative Mouse Mode"),
+     TRANSLATABLE("PlayStationMouse", "Locks the mouse cursor to the window, use for FPS games."), "false"},
+  }};
+
+  return SettingList(settings.begin(), settings.end());
+}
+
+void PlayStationMouse::LoadSettings(const char* section)
+{
+  Controller::LoadSettings(section);
+
+  m_use_relative_mode = g_host_interface->GetBoolSettingValue(section, "RelativeMouseMode");
+}
+
+bool PlayStationMouse::GetSoftwareCursor(const Common::RGBA8Image** image, float* image_scale, bool* relative_mode)
+{
+  *relative_mode = m_use_relative_mode;
+  return m_use_relative_mode;
+}

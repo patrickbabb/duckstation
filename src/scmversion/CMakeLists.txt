@@ -1,19 +1,15 @@
-if(CMAKE_HOST_SYSTEM MATCHES "Windows")
-  add_custom_target(generate_scmversion
-                    COMMAND cmd /k "${CMAKE_CURRENT_SOURCE_DIR}/gen_scmversion.bat"
-                    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-                    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/scmversion.cpp"
-                    COMMENT "Checking if scmversion.cpp needs to be updated")
+# _scmversion.cpp is a dummy file that will never be created, so the command will always be run
+if(WIN32)
+  add_custom_command(OUTPUT scmversion.cpp _scmversion.cpp
+                     COMMAND cmd /k "${CMAKE_CURRENT_SOURCE_DIR}/gen_scmversion.bat"
+                     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 else()
-  add_custom_target(generate_scmversion
-                    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/gen_scmversion.sh"
-                    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-                    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/scmversion.cpp"
-                    COMMENT "Checking if scmversion.cpp needs to be updated")
+  add_custom_command(OUTPUT scmversion.cpp _scmversion.cpp
+                     COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/gen_scmversion.sh")
 endif()
 
 add_library(scmversion
-  "${CMAKE_CURRENT_BINARY_DIR}/scmversion.cpp"
+  scmversion.cpp
   scmversion.h
 )
-add_dependencies(scmversion generate_scmversion)
+

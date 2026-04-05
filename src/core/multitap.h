@@ -1,12 +1,8 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com> and contributors.
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #pragma once
-
-#include "controller.h"
-
+#include "common/state_wrapper.h"
 #include "common/types.h"
-
+#include "controller.h"
+#include "memory_card.h"
 #include <array>
 
 class Multitap final

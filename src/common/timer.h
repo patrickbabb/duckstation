@@ -1,8 +1,7 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
-
 #pragma once
 #include <cstdint>
+
+namespace Common {
 
 class Timer
 {
@@ -11,9 +10,7 @@ public:
 
   Timer();
 
-  static double GetFrequency();
-  static Value GetCurrentValue();
-
+  static Value GetValue();
   static double ConvertValueToSeconds(Value value);
   static double ConvertValueToMilliseconds(Value value);
   static double ConvertValueToNanoseconds(Value value);
@@ -26,22 +23,13 @@ public:
   static void SleepUntil(Value value, bool exact);
 
   void Reset();
-  void ResetTo(Value value) { m_tvStartValue = value; }
-
-  Value GetStartValue() const { return m_tvStartValue; }
 
   double GetTimeSeconds() const;
   double GetTimeMilliseconds() const;
   double GetTimeNanoseconds() const;
 
-  double GetTimeSecondsAndReset();
-  double GetTimeMillisecondsAndReset();
-  double GetTimeNanosecondsAndReset();
-
-  bool ResetIfSecondsPassed(double s);
-  bool ResetIfMillisecondsPassed(double s);
-  bool ResetIfNanosecondsPassed(double s);
-
 private:
   Value m_tvStartValue;
 };
+
+} // namespace Common
