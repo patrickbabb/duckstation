@@ -91,7 +91,6 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
     }
 
     private void reportErrorOnUIThread(String message) {
-        // Toast.makeText(this, message, Toast.LENGTH_LONG);
         new AlertDialog.Builder(this)
                 .setTitle(R.string.emulation_activity_error)
                 .setMessage(message)
@@ -108,7 +107,6 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
 
         Object lock = new Object();
         runOnUiThread(() -> {
-            // Toast.makeText(this, message, Toast.LENGTH_LONG);
             new AlertDialog.Builder(this)
                     .setTitle(R.string.emulation_activity_error)
                     .setMessage(message)
@@ -217,7 +215,6 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
         }
     }
 
-    /// Ends the activity if it was restored without properly being created.
     private boolean checkActivityIsValid() {
         if (!AndroidHostInterface.hasInstance() || !AndroidHostInterface.getInstance().isEmulationThreadRunning()) {
             finish();
@@ -233,7 +230,6 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-        // Once we get a surface, we can boot.
         AndroidHostInterface.getInstance().surfaceChanged(holder.getSurface(), format, width, height);
 
         if (mEmulationThread != null) {
@@ -262,7 +258,6 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
         if (mPauseMenu != null)
             mPauseMenu.close(false);
 
-        // Save the resume state in case we never get back again...
         if (AndroidHostInterface.getInstance().isEmulationThreadRunning() && !mStopRequested)
             AndroidHostInterface.getInstance().saveResumeState(true);
 
@@ -276,7 +271,6 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
 
         Log.i("EmulationActivity", "OnCreate");
 
-        // we might be coming from a third-party launcher if the host interface isn't setup
         if (!AndroidHostInterface.hasInstance() && !AndroidHostInterface.createInstance(this)) {
             finish();
             return;
@@ -294,12 +288,10 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
         }
         mContentView.requestFocus();
 
-        // Sort out rotation.
         updateOrientation();
         updateSustainedPerformanceMode();
         updateDisplayInCutout();
 
-        // Hook up controller input.
         updateControllers();
         registerInputDeviceListener();
     }
@@ -333,7 +325,6 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
         super.onActivityResult(requestCode, resultCode, data);
 
         if (!checkActivityIsValid()) {
-            // we must've got killed off in the background :(
             return;
         }
 
@@ -388,18 +379,6 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
             updateOrientation(newConfig.orientation);
     }
 
-//    private void updateRequestedOrientation() {
-//        final String orientation = getStringSetting("Main/EmulationScreenOrientation", "unspecified");
-//        if (orientation.equals("portrait"))
-//            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_USER_PORTRAIT);
-//        else if (orientation.equals("landscape"))
-//            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_USER_LANDSCAPE);
-//        else if (orientation.equals("sensor"))
-//            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR);
-//        else
-//            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
-//    }
-
     private void updateRequestedOrientation() {
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
     }
@@ -449,7 +428,7 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
         getWindow().setAttributes(attribs);
     }
 
-    private static final int REQUEST_CODE_SETTINGS = 0;
+    private static final int REQUEST_CODE_SETTINGS    = 0;
     private static final int REQUEST_IMPORT_PATCH_CODES = 1;
     private static final int REQUEST_CHANGE_DISC_FILE = 2;
 
@@ -517,82 +496,31 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
         dialog.show();
     }
 
+    /**
+     * Simplified controller menu — layout editing removed, RadialGamePad handles its own layout.
+     * Only "Change Type" is retained so the user can still switch digital ↔ analog.
+     */
     private void showTouchscreenControllerMenu() {
-        AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        builder.setTitle(R.string.dialog_touchscreen_controller_settings);
-        builder.setItems(R.array.emulation_touchscreen_menu, (dialogInterface, i) -> {
-            switch (i) {
-                case 0:     // Change Type
-                {
-                    final String currentValue = getStringSetting("Controller1/TouchscreenControllerView", "");
-                    final String[] values = getResources().getStringArray(R.array.settings_touchscreen_controller_view_values);
-                    int currentIndex = -1;
-                    for (int k = 0; k < values.length; k++) {
-                        if (currentValue.equals(values[k])) {
-                            currentIndex = k;
-                            break;
-                        }
-                    }
+        final String currentValue = getStringSetting("Controller1/TouchscreenControllerView", "");
+        final String[] values   = getResources().getStringArray(R.array.settings_touchscreen_controller_view_values);
+        final String[] entries  = getResources().getStringArray(R.array.settings_touchscreen_controller_view_entries);
 
-                    final AlertDialog.Builder subBuilder = new AlertDialog.Builder(this);
-                    subBuilder.setTitle(R.string.dialog_touchscreen_controller_type);
-                    subBuilder.setSingleChoiceItems(R.array.settings_touchscreen_controller_view_entries, currentIndex, (dialog, j) -> {
-                        setStringSetting("Controller1/TouchscreenControllerView", values[j]);
-                        updateControllers();
-                    });
-                    subBuilder.setNegativeButton(R.string.dialog_done, (dialog, which) -> {
-                        dialog.dismiss();
-                    });
-                    subBuilder.setOnDismissListener(dialog -> onMenuClosed());
-                    subBuilder.create().show();
-                }
-                break;
-
-                case 1:     // Change Opacity
-                {
-                    if (mTouchscreenController != null) {
-                        AlertDialog.Builder subBuilder = mTouchscreenController.createOpacityDialog(this);
-                        subBuilder.setOnDismissListener(dialog -> onMenuClosed());
-                        subBuilder.create().show();
-                    } else {
-                        onMenuClosed();
-                    }
-
-                }
-                break;
-
-                case 2:     // Add/Remove Buttons
-                {
-                    if (mTouchscreenController != null) {
-                        AlertDialog.Builder subBuilder = mTouchscreenController.createAddRemoveButtonDialog(this);
-                        subBuilder.setOnDismissListener(dialog -> onMenuClosed());
-                        subBuilder.create().show();
-                    } else {
-                        onMenuClosed();
-                    }
-                }
-                break;
-
-                case 3:     // Edit Positions
-                case 4:     // Edit Scale
-                {
-                    if (mTouchscreenController != null) {
-                        // we deliberately don't call onMenuClosed() here to keep the system paused.
-                        // but we need to re-enable immersive mode to get proper editing.
-                        enableFullscreenImmersive();
-                        mTouchscreenController.startLayoutEditing(
-                                (i == 4) ? TouchscreenControllerView.EditMode.SCALE :
-                                        TouchscreenControllerView.EditMode.POSITION);
-                    } else {
-                        // no controller
-                        onMenuClosed();
-                    }
-                }
+        int currentIndex = -1;
+        for (int k = 0; k < values.length; k++) {
+            if (currentValue.equals(values[k])) {
+                currentIndex = k;
                 break;
             }
-        });
+        }
 
-        builder.setOnCancelListener(dialogInterface -> onMenuClosed());
+        final AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle(R.string.dialog_touchscreen_controller_type);
+        builder.setSingleChoiceItems(entries, currentIndex, (dialog, j) -> {
+            setStringSetting("Controller1/TouchscreenControllerView", values[j]);
+            updateControllers();
+        });
+        builder.setNegativeButton(R.string.dialog_done, (dialog, which) -> dialog.dismiss());
+        builder.setOnDismissListener(dialog -> onMenuClosed());
         builder.create().show();
     }
 
@@ -689,9 +617,9 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
     }
 
     /**
-     * Touchscreen controller overlay
+     * Touchscreen controller overlay — now backed by RadialGamePad.
      */
-    TouchscreenControllerView mTouchscreenController;
+    RadialGamePadControllerView mTouchscreenController;
 
     public void updateControllers() {
         final int touchscreenControllerIndex = getIntSetting("TouchscreenController/PortIndex", 0);
@@ -699,8 +627,6 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
         final String controllerType = getStringSetting(touchscreenControllerPrefix + "Type", "DigitalController");
         final String viewType = getStringSetting("Controller1/TouchscreenControllerView", "digital");
         final boolean autoHideTouchscreenController = getBooleanSetting("Controller1/AutoHideTouchscreenController", false);
-        final boolean touchGliding = getBooleanSetting("Controller1/TouchGliding", false);
-        final boolean hapticFeedback = getBooleanSetting("Controller1/HapticFeedback", false);
         final boolean vibration = getBooleanSetting("Controller1/Vibration", true);
         final FrameLayout activityLayout = findViewById(R.id.frameLayout);
 
@@ -718,11 +644,12 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
             }
         } else {
             if (mTouchscreenController == null) {
-                mTouchscreenController = new TouchscreenControllerView(this);
+                mTouchscreenController = new RadialGamePadControllerView(this);
                 activityLayout.addView(mTouchscreenController);
             }
 
-            mTouchscreenController.init(touchscreenControllerIndex, controllerType, viewType, hapticFeedback, touchGliding);
+            // Pass getLifecycle() so RadialGamePad's coroutine scope is lifecycle-aware
+            mTouchscreenController.init(touchscreenControllerIndex, controllerType, viewType);
         }
 
         if (vibration)
@@ -730,7 +657,6 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
         else
             mVibratorService = null;
 
-        // Place notifications in the middle of the screen, rather then the bottom (because touchscreen).
         float notificationVerticalPosition = 1.0f;
         float notificationVerticalDirection = -1.0f;
         if (mTouchscreenController != null) {
@@ -814,7 +740,6 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
             Log.e("EmulationActivity", "Sustained performance mode not supported.");
         }
         mSustainedPerformanceModeEnabled = enabled;
-
     }
 
     public static class MenuDialogFragment extends DialogFragment {
@@ -841,7 +766,7 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
         public void onViewCreated(View view, Bundle savedInstanceState) {
             setContentFragment(new MenuSettingsFragment(this, emulationActivity), false);
 
-            final ImageView coverView =((ImageView)view.findViewById(R.id.cover_image));
+            final ImageView coverView = ((ImageView) view.findViewById(R.id.cover_image));
             if (emulationActivity.mGameCoverPath != null && !emulationActivity.mGameCoverPath.isEmpty()) {
                 new ImageLoadTask(coverView).executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR,
                         emulationActivity.mGameCoverPath);
@@ -852,19 +777,18 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
             coverView.setOnClickListener(v -> close(true));
 
             if (emulationActivity.mGameTitle != null)
-              ((TextView)view.findViewById(R.id.title)).setText(emulationActivity.mGameTitle);
+                ((TextView) view.findViewById(R.id.title)).setText(emulationActivity.mGameTitle);
 
-            if (emulationActivity.mGameCode != null && emulationActivity.mGamePath != null)
-            {
-              final String subtitle = String.format("%s - %s", emulationActivity.mGameCode,
-                      FileHelper.getFileNameForPath(emulationActivity.mGamePath));
-              ((TextView)view.findViewById(R.id.subtitle)).setText(subtitle);
+            if (emulationActivity.mGameCode != null && emulationActivity.mGamePath != null) {
+                final String subtitle = String.format("%s - %s", emulationActivity.mGameCode,
+                        FileHelper.getFileNameForPath(emulationActivity.mGamePath));
+                ((TextView) view.findViewById(R.id.subtitle)).setText(subtitle);
             }
 
-            ((ImageButton)view.findViewById(R.id.menu)).setOnClickListener(v -> onMenuClicked());
-            ((ImageButton)view.findViewById(R.id.controller_settings)).setOnClickListener(v -> onControllerSettingsClicked());
-            ((ImageButton)view.findViewById(R.id.settings)).setOnClickListener(v -> onSettingsClicked());
-            ((ImageButton)view.findViewById(R.id.close)).setOnClickListener(v -> close(true));
+            ((ImageButton) view.findViewById(R.id.menu)).setOnClickListener(v -> onMenuClicked());
+            ((ImageButton) view.findViewById(R.id.controller_settings)).setOnClickListener(v -> onControllerSettingsClicked());
+            ((ImageButton) view.findViewById(R.id.settings)).setOnClickListener(v -> onSettingsClicked());
+            ((ImageButton) view.findViewById(R.id.close)).setOnClickListener(v -> close(true));
         }
 
         @Override
