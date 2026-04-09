@@ -149,9 +149,9 @@ class RadialGamePadControllerView @JvmOverloads constructor(
         val faceButtons = PrimaryDialConfig.PrimaryButtons(
             dials = listOf(
                 ButtonConfig(id = ID_CIRCLE,   label = "○"),
-                ButtonConfig(id = ID_CROSS,    label = "✕"),
+                ButtonConfig(id = ID_TRIANGLE, label = "△"),
                 ButtonConfig(id = ID_SQUARE,   label = "□"),
-                ButtonConfig(id = ID_TRIANGLE, label = "△")
+                ButtonConfig(id = ID_CROSS,    label = "✕")
             )
         )
 

@@ -84,7 +84,7 @@ struct Settings
   float emulation_speed = 1.0f;
   float fast_forward_speed = 0.0f;
   float turbo_speed = 0.0f;
-  bool sync_to_host_refresh_rate = true;
+  bool sync_to_host_refresh_rate = false;
   bool increase_timer_resolution = true;
   bool start_paused = false;
   bool start_fullscreen = true;
@@ -105,7 +105,7 @@ struct Settings
   GPURenderer gpu_renderer = GPURenderer::Software;
   std::string gpu_adapter;
   std::string display_post_process_chain;
-  u32 gpu_resolution_scale = 1;
+  u32 gpu_resolution_scale = 4;
   u32 gpu_multisamples = 1;
   bool gpu_use_thread = true;
   bool gpu_use_software_renderer_for_readbacks = false;
@@ -123,7 +123,7 @@ struct Settings
   bool gpu_pgxp_culling = true;
   bool gpu_pgxp_texture_correction = true;
   bool gpu_pgxp_vertex_cache = true;
-  bool gpu_pgxp_cpu = true;
+  bool gpu_pgxp_cpu = false;
   bool gpu_pgxp_preserve_proj_fp = false;
   bool gpu_pgxp_depth_buffer = false;
   DisplayCropMode display_crop_mode = DisplayCropMode::None;
@@ -155,7 +155,7 @@ struct Settings
   bool cdrom_region_check = false;
   bool cdrom_load_image_to_ram = false;
   bool cdrom_mute_cd_audio = false;
-  u32 cdrom_read_speedup = 1;
+  u32 cdrom_read_speedup = 4;
   u32 cdrom_seek_speedup = 1;
 
   AudioBackend audio_backend = AudioBackend::Cubeb;
@@ -164,7 +164,7 @@ struct Settings
   u32 audio_buffer_size = 2048;
   bool audio_resampling = false;
   bool audio_output_muted = false;
-  bool audio_sync_enabled = true;
+  bool audio_sync_enabled = false;
   bool audio_dump_on_boot = true;
 
   // timing hacks section

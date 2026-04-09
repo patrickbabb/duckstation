@@ -37,7 +37,7 @@
             android:immersive="true"
             android:label="@string/title_activity_emulation"
             android:parentActivityName=".SingleGameActivity"
-            android:theme="@style/Theme.AppCompat.DayNight.NoActionBar"
+            android:theme="@style/AppTheme.NoActionBar"
             android:screenOrientation="sensorLandscape">
 
             <meta-data

@@ -11,6 +11,8 @@ import android.net.Uri;
 import android.os.AsyncTask;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.Vibrator;
 import android.util.Log;
 import android.view.Display;
@@ -26,7 +28,10 @@ import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.ListView;
 import android.widget.TextView;
+import android.widget.Toast;
 
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AlertDialog;
@@ -37,6 +42,14 @@ import androidx.fragment.app.FragmentTransaction;
 import androidx.preference.Preference;
 import androidx.preference.PreferenceFragmentCompat;
 import androidx.preference.PreferenceManager;
+
+import com.google.android.material.dialog.MaterialAlertDialogBuilder;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import java.util.zip.ZipOutputStream;
 
 /**
  * An example full-screen activity that shows and hides the system UI (i.e.
@@ -56,6 +69,22 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
     private String mGameCoverPath = null;
     private EmulationSurfaceView mContentView;
     private MenuDialogFragment mPauseMenu;
+
+    private final Handler uiHandler = new Handler(Looper.getMainLooper());
+
+    // =============================
+    // Save Manager Launchers
+    // =============================
+
+    private final ActivityResultLauncher<String> exportLauncher =
+            registerForActivityResult(new ActivityResultContracts.CreateDocument("application/zip"), uri -> {
+                if (uri != null) exportSavesToUri(uri);
+            });
+
+    private final ActivityResultLauncher<String[]> importLauncher =
+            registerForActivityResult(new ActivityResultContracts.OpenDocument(), uri -> {
+                if (uri != null) importSaves(uri);
+            });
 
     private boolean getBooleanSetting(String key, boolean defaultValue) {
         return mPreferences.getBoolean(key, defaultValue);
@@ -347,7 +376,7 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
 
     @Override
     public void onBackPressed() {
-        //showPauseMenu();
+        showAdminMenu();
     }
 
     @Override
@@ -494,6 +523,150 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
         });
 
         dialog.show();
+    }
+
+    // =============================
+    // Admin / Save Manager Menu
+    // =============================
+
+    void showAdminMenu() {
+        final String[] options = {
+                "Quick Save",
+                "Quick Load",
+                "Export Saves",
+                "Import Saves"
+        };
+
+        new MaterialAlertDialogBuilder(this)
+                .setItems(options, (dialog, which) -> {
+                    switch (which) {
+                        case 0: // Quick Save
+                            AndroidHostInterface.getInstance().saveState(false, 0);
+                            Toast.makeText(this, "State Saved", Toast.LENGTH_SHORT).show();
+                            break;
+                        case 1: // Quick Load
+                            AndroidHostInterface.getInstance().loadState(false, 0);
+                            break;
+                        case 2: // Export Saves
+                            String date = new java.text.SimpleDateFormat("ddMMyyyy", java.util.Locale.getDefault())
+                                    .format(new java.util.Date());
+                            String title = (mGameTitle != null && !mGameTitle.isEmpty()) ? mGameTitle : "DuckStation";
+                            exportLauncher.launch(title + "_SaveBackup_" + date + ".zip");
+                            break;
+                        case 3: // Import Saves
+                            importLauncher.launch(new String[]{"application/zip"});
+                            break;
+                    }
+                })
+                .setNegativeButton("Close", null)
+                .show();
+    }
+
+    // =============================
+    // Save Export
+    // =============================
+
+    private void exportSavesToUri(Uri uri) {
+        if (!AndroidHostInterface.getInstance().isEmulationThreadRunning()) return;
+
+        AndroidHostInterface.getInstance().pauseEmulationThread(true);
+
+        uiHandler.postDelayed(() -> {
+            try {
+                getContentResolver().openOutputStream(uri, "w");
+                try (java.io.OutputStream output = getContentResolver().openOutputStream(uri);
+                     ZipOutputStream zip = new ZipOutputStream(output)) {
+
+                    final String userDir = AndroidHostInterface.getUserDirectory();
+                    zipFolder(new File(userDir, "MemoryCards"), "MemoryCards", zip);
+                    zipFolder(new File(userDir, "SaveStates"), "SaveStates", zip);
+                }
+
+                Toast.makeText(this, "Saves exported successfully", Toast.LENGTH_LONG).show();
+
+            } catch (Exception e) {
+                Toast.makeText(this, "Export failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            }
+
+            uiHandler.postDelayed(() ->
+                    AndroidHostInterface.getInstance().pauseEmulationThread(false), 250);
+
+        }, 150);
+    }
+
+    private void zipFolder(File folder, String parentName, ZipOutputStream zip) throws IOException {
+        if (!folder.exists()) return;
+
+        File[] files = folder.listFiles();
+        if (files == null) return;
+
+        for (File file : files) {
+            final String entryName = parentName + "/" + file.getName();
+            if (file.isDirectory()) {
+                zipFolder(file, entryName, zip);
+            } else {
+                zip.putNextEntry(new ZipEntry(entryName));
+                try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
+                    byte[] buf = new byte[8192];
+                    int len;
+                    while ((len = fis.read(buf)) > 0) zip.write(buf, 0, len);
+                }
+                zip.closeEntry();
+            }
+        }
+    }
+
+    // =============================
+    // Save Import
+    // =============================
+
+    private void importSaves(Uri uri) {
+        if (!AndroidHostInterface.getInstance().isEmulationThreadRunning()) return;
+
+        AndroidHostInterface.getInstance().pauseEmulationThread(true);
+
+        uiHandler.postDelayed(() -> {
+            try {
+                final String userDir = AndroidHostInterface.getUserDirectory();
+                final File baseDir = new File(userDir).getCanonicalFile();
+
+                try (java.io.InputStream input = getContentResolver().openInputStream(uri);
+                     ZipInputStream zip = new ZipInputStream(input)) {
+
+                    java.util.zip.ZipEntry entry = zip.getNextEntry();
+                    while (entry != null) {
+                        final File outFile = new File(baseDir, entry.getName()).getCanonicalFile();
+
+                        if (!outFile.getPath().startsWith(baseDir.getPath())) {
+                            throw new SecurityException("Invalid zip entry path");
+                        }
+
+                        if (entry.isDirectory()) {
+                            outFile.mkdirs();
+                        } else {
+                            outFile.getParentFile().mkdirs();
+                            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(outFile)) {
+                                byte[] buf = new byte[8192];
+                                int len;
+                                while ((len = zip.read(buf)) > 0) fos.write(buf, 0, len);
+                            }
+                        }
+
+                        zip.closeEntry();
+                        entry = zip.getNextEntry();
+                    }
+                }
+
+                Toast.makeText(this, "Saves imported successfully", Toast.LENGTH_LONG).show();
+
+            } catch (Exception e) {
+                Toast.makeText(this, "Import failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            }
+
+            uiHandler.postDelayed(() ->
+                    AndroidHostInterface.getInstance().pauseEmulationThread(false), 250);
+
+        }, 150);
     }
 
     /**
@@ -900,6 +1073,11 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
             createPreference(R.string.emulation_menu_reset_console, R.drawable.ic_baseline_restart_alt_24, true, preference -> {
                 AndroidHostInterface.getInstance().resetSystem();
                 menuDialogFragment.close(true);
+                return true;
+            });
+            createPreference(R.string.emulation_menu_save_manager, R.drawable.ic_baseline_save_24, true, preference -> {
+                menuDialogFragment.close(false);
+                emulationActivity.showAdminMenu();
                 return true;
             });
         }
