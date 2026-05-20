@@ -578,8 +578,8 @@ public class EmulationActivity extends AppCompatActivity implements SurfaceHolde
                      ZipOutputStream zip = new ZipOutputStream(output)) {
 
                     final String userDir = AndroidHostInterface.getUserDirectory();
-                    zipFolder(new File(userDir, "MemoryCards"), "MemoryCards", zip);
-                    zipFolder(new File(userDir, "SaveStates"), "SaveStates", zip);
+                    zipFolder(new File(userDir, "memcards"), "memcards", zip);
+                    zipFolder(new File(userDir, "savestates"), "savestates", zip);
                 }
 
                 Toast.makeText(this, "Saves exported successfully", Toast.LENGTH_LONG).show();

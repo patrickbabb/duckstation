@@ -5,11 +5,20 @@ repositories {
     maven { url "https://jitpack.io" }
 }
 
+// ============================================================
+// Local game config — gitignored, optional
+// ============================================================
+def localConfigFile = file('local_game_config.properties')
+def localConfig = new Properties()
+if (localConfigFile.exists()) {
+    localConfigFile.withInputStream { localConfig.load(it) }
+}
+
 android {
     compileSdkVersion 34
     buildToolsVersion "30.0.2"
     defaultConfig {
-        applicationId "com.github.stenzek.finalfantasy7"
+        applicationId "com.github.stenzek.duckstation" + (localConfig.getProperty('app_id_suffix', ''))
         minSdkVersion 23
         targetSdkVersion 34
         versionCode(getBuildVersionCode())
@@ -19,10 +28,13 @@ android {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-
+            resValue "string", "app_name", localConfig.getProperty('app_name', 'DuckStation')
             ndk {
                 debugSymbolLevel "FULL"
             }
+        }
+        debug {
+            resValue "string", "app_name", localConfig.getProperty('app_name_debug', 'DuckStation (Debug)')
         }
     }
 
@@ -46,9 +58,9 @@ android {
     }
     sourceSets {
         main.assets.srcDirs += "../../data"
+        main.res.srcDirs += ['src/main/res-local']
     }
 
-    // Blocked on R21 until CMake is updated to 3.19 or later.
     ndkVersion '21.4.7075529'
     kotlinOptions {
         jvmTarget = '1.8'
@@ -72,11 +84,8 @@ dependencies {
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.4'
 }
 
-// Adapted from Dolphin.
-
 def getVersion() {
     def versionNumber = '0.0-unknown'
-
     try {
         versionNumber = 'git describe --tags --exclude latest --exclude preview'.execute([], project.rootDir).text
                 .trim()
@@ -84,10 +93,8 @@ def getVersion() {
     } catch (Exception e) {
         logger.error('Cannot find git, defaulting to dummy version number')
     }
-
     return versionNumber
 }
-
 
 def getBuildVersionCode() {
     try {
@@ -97,6 +104,5 @@ def getBuildVersionCode() {
     } catch (Exception e) {
         logger.error('Cannot find git, defaulting to dummy version number')
     }
-
     return 1;
 }

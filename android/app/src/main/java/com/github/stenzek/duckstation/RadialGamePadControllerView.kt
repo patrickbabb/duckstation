@@ -25,31 +25,14 @@ class RadialGamePadControllerView @JvmOverloads constructor(
     defStyle: Int = 0
 ) : FrameLayout(context, attrs, defStyle) {
 
-    companion object {
-        private const val ID_DPAD         = 0
-        private const val ID_LEFT_STICK   = 1
-        private const val ID_RIGHT_STICK  = 2
-
-        private const val ID_CIRCLE       = 10
-        private const val ID_CROSS        = 11
-        private const val ID_SQUARE       = 12
-        private const val ID_TRIANGLE     = 13
-
-        private const val ID_L1           = 20
-        private const val ID_L2           = 21
-        private const val ID_R1           = 22
-        private const val ID_R2           = 23
-
-        private const val ID_SELECT       = 30
-        private const val ID_START        = 31
-        private const val ID_L3           = 32
-        private const val ID_R3           = 33
-    }
-
     private var mControllerIndex = 0
     private var mControllerType  = ""
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    // Toggle state: tracks which toggle buttons are currently pressed
+    private val toggleButtonIds = LocalPadConfig.toggleButtons
+    private val toggleState = mutableMapOf<Int, Boolean>()
 
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
@@ -63,124 +46,65 @@ class RadialGamePadControllerView @JvmOverloads constructor(
         removeAllViews()
 
         val hasAnalog = controllerType == "AnalogController" && viewType != "digital"
-        setupLeftPad(hasAnalog)
-        setupRightPad(hasAnalog)
+        setupPad(LocalPadConfig.leftPad,  hasAnalog, Gravity.START)
+        setupPad(LocalPadConfig.rightPad, hasAnalog, Gravity.END)
     }
 
     fun updateOrientation() = Unit
 
     // -------------------------------------------------------------------------
-    // Socket index map (8 sockets, clockwise from top):
-    //         0
-    //     7       1
-    //   6           2
-    //     5       3
-    //         4
-    //
-    // Left pad:  D-pad center, shoulder buttons across the top, Select top-center
-    // Right pad: Face buttons center, shoulder buttons across the top, Start top-center
+    // Build a RadialGamePadConfig from a PadConfig data object
     // -------------------------------------------------------------------------
 
-    private fun buildLeftPadConfig(hasAnalog: Boolean): RadialGamePadConfig {
+    private fun buildPadConfig(config: PadConfig, hasAnalog: Boolean): RadialGamePadConfig {
         val secondaryDials = mutableListOf<SecondaryDialConfig>()
 
-        secondaryDials += SecondaryDialConfig.Empty(2, 1, 0.5f, 2f)
+        for (dial in config.secondaryDials) {
+            when (dial) {
+                is PadDial.Empty -> secondaryDials += SecondaryDialConfig.Empty(
+                    dial.index, dial.spread, dial.scale, dial.distance
+                )
+                is PadDial.Button -> secondaryDials += SecondaryDialConfig.SingleButton(
+                    dial.index, dial.scale, dial.distance,
+                    ButtonConfig(id = dial.id, label = dial.label)
+                )
+                is PadDial.Stick -> if (hasAnalog) secondaryDials += SecondaryDialConfig.Stick(
+                    index    = dial.index,
+                    spread   = dial.spread,
+                    scale    = dial.scale,
+                    distance = dial.distance,
+                    id       = dial.id
+                )
+            }
+        }
 
-        secondaryDials += SecondaryDialConfig.SingleButton(
-            2, 1f, 0f,
-            ButtonConfig(id = ID_SELECT, label = "SEL")
-        )
-        secondaryDials += SecondaryDialConfig.SingleButton(
-            3, 1f, 0f,
-            ButtonConfig(id = ID_L1, label = "L1")
-        )
-        secondaryDials += SecondaryDialConfig.SingleButton(
-            4, 1f, 0f,
-            ButtonConfig(id = ID_L2, label = "L2")
-        )
-
-        if (hasAnalog) {
-            secondaryDials += SecondaryDialConfig.Empty(8, 1, 1f, 0f)
-            secondaryDials += SecondaryDialConfig.Stick(
-                index    = 9,
-                spread   = 2,
-                scale    = 2.2f,
-                distance = 0.1f,
-                id       = ID_LEFT_STICK
+        val primaryDial = when (val p = config.primaryDial) {
+            is PrimaryDialDef.Cross -> PrimaryDialConfig.Cross(CrossConfig(id = p.id))
+            is PrimaryDialDef.Buttons -> PrimaryDialConfig.PrimaryButtons(
+                dials = p.dials.map { ButtonConfig(id = it.id, label = it.label) }
             )
         }
 
         return RadialGamePadConfig(
-            sockets        = 12,
-            primaryDial    = PrimaryDialConfig.Cross(CrossConfig(id = ID_DPAD)),
+            sockets        = config.socketCount,
+            primaryDial    = primaryDial,
             secondaryDials = secondaryDials
         )
     }
 
-    private fun buildRightPadConfig(hasAnalog: Boolean): RadialGamePadConfig {
-        val secondaryDials = mutableListOf<SecondaryDialConfig>()
-
-        secondaryDials += SecondaryDialConfig.Empty(4, 1, 0.5f, 2f)
-
-        secondaryDials += SecondaryDialConfig.SingleButton(
-            2, 1f, 0f,
-            ButtonConfig(id = ID_R1, label = "R1")
-        )
-        secondaryDials += SecondaryDialConfig.SingleButton(
-            3, 1f, 0f,
-            ButtonConfig(id = ID_R2, label = "R2")
-        )
-        secondaryDials += SecondaryDialConfig.SingleButton(
-            4, 1f, 0f,
-            ButtonConfig(id = ID_START, label = "START")
-        )
-
-        if (hasAnalog) {
-            secondaryDials += SecondaryDialConfig.Empty(8, 1, 1f, 0f)
-            secondaryDials += SecondaryDialConfig.Stick(
-                index    = 9,
-                spread   = 2,
-                scale    = 2.2f,
-                distance = 0.1f,
-                id       = ID_RIGHT_STICK
-            )
-        }
-
-        val faceButtons = PrimaryDialConfig.PrimaryButtons(
-            dials = listOf(
-                ButtonConfig(id = ID_CIRCLE,   label = "○"),
-                ButtonConfig(id = ID_TRIANGLE, label = "△"),
-                ButtonConfig(id = ID_SQUARE,   label = "□"),
-                ButtonConfig(id = ID_CROSS,    label = "✕")
-            )
-        )
-
-        return RadialGamePadConfig(
-            sockets        = 12,
-            primaryDial    = faceButtons,
-            secondaryDials = secondaryDials
-        )
-    }
-
-    private fun setupLeftPad(hasAnalog: Boolean) {
-        val pad = RadialGamePad(buildLeftPadConfig(hasAnalog), 25f, context)
+    private fun setupPad(config: PadConfig, hasAnalog: Boolean, gravity: Int) {
+        val pad = RadialGamePad(buildPadConfig(config, hasAnalog), LocalPadConfig.PAD_SIZE, context)
         addView(pad, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT).apply {
-            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            this.gravity = gravity or Gravity.CENTER_VERTICAL
         })
         scope.launch {
             pad.events().collect { handleEvent(it) }
         }
     }
 
-    private fun setupRightPad(hasAnalog: Boolean) {
-        val pad = RadialGamePad(buildRightPadConfig(hasAnalog), 25f, context)
-        addView(pad, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT).apply {
-            gravity = Gravity.END or Gravity.CENTER_VERTICAL
-        })
-        scope.launch {
-            pad.events().collect { handleEvent(it) }
-        }
-    }
+    // -------------------------------------------------------------------------
+    // Event handling
+    // -------------------------------------------------------------------------
 
     private fun handleEvent(event: Event) {
         when (event) {
@@ -191,13 +115,23 @@ class RadialGamePadControllerView @JvmOverloads constructor(
 
     private fun handleButton(event: Event.Button) {
         val code = idToButtonCode(event.id) ?: return
-        val pressed = event.action == MotionEvent.ACTION_DOWN
-        AndroidHostInterface.getInstance().setControllerButtonState(mControllerIndex, code, pressed)
+
+        if (event.id in toggleButtonIds) {
+            // Toggle on ACTION_DOWN only
+            if (event.action == MotionEvent.ACTION_DOWN) {
+                val newState = !(toggleState[event.id] ?: false)
+                toggleState[event.id] = newState
+                AndroidHostInterface.getInstance().setControllerButtonState(mControllerIndex, code, newState)
+            }
+        } else {
+            val pressed = event.action == MotionEvent.ACTION_DOWN
+            AndroidHostInterface.getInstance().setControllerButtonState(mControllerIndex, code, pressed)
+        }
     }
 
     private fun handleDirection(event: Event.Direction) {
         when (event.id) {
-            ID_DPAD -> {
+            PsxIds.DPAD -> {
                 val upCode    = AndroidHostInterface.getControllerButtonCode(mControllerType, "Up")
                 val downCode  = AndroidHostInterface.getControllerButtonCode(mControllerType, "Down")
                 val leftCode  = AndroidHostInterface.getControllerButtonCode(mControllerType, "Left")
@@ -209,7 +143,7 @@ class RadialGamePadControllerView @JvmOverloads constructor(
                 setButton(leftCode,  event.xAxis < -t)
                 setButton(rightCode, event.xAxis >  t)
             }
-            ID_LEFT_STICK -> {
+            PsxIds.LEFT_STICK -> {
                 val xCode = AndroidHostInterface.getControllerAxisCode(mControllerType, "LeftX")
                 val yCode = AndroidHostInterface.getControllerAxisCode(mControllerType, "LeftY")
                 if (xCode >= 0) AndroidHostInterface.getInstance()
@@ -217,7 +151,7 @@ class RadialGamePadControllerView @JvmOverloads constructor(
                 if (yCode >= 0) AndroidHostInterface.getInstance()
                     .setControllerAxisState(mControllerIndex, yCode, event.yAxis)
             }
-            ID_RIGHT_STICK -> {
+            PsxIds.RIGHT_STICK -> {
                 val xCode = AndroidHostInterface.getControllerAxisCode(mControllerType, "RightX")
                 val yCode = AndroidHostInterface.getControllerAxisCode(mControllerType, "RightY")
                 if (xCode >= 0) AndroidHostInterface.getInstance()
@@ -235,19 +169,19 @@ class RadialGamePadControllerView @JvmOverloads constructor(
 
     private fun idToButtonCode(id: Int): Int? {
         val name = when (id) {
-            ID_CROSS     -> "Cross"
-            ID_CIRCLE    -> "Circle"
-            ID_SQUARE    -> "Square"
-            ID_TRIANGLE  -> "Triangle"
-            ID_L1        -> "L1"
-            ID_L2        -> "L2"
-            ID_R1        -> "R1"
-            ID_R2        -> "R2"
-            ID_SELECT    -> "Select"
-            ID_START     -> "Start"
-            ID_L3        -> "L3"
-            ID_R3        -> "R3"
-            else         -> return null
+            PsxIds.CROSS     -> "Cross"
+            PsxIds.CIRCLE    -> "Circle"
+            PsxIds.SQUARE    -> "Square"
+            PsxIds.TRIANGLE  -> "Triangle"
+            PsxIds.L1        -> "L1"
+            PsxIds.L2        -> "L2"
+            PsxIds.R1        -> "R1"
+            PsxIds.R2        -> "R2"
+            PsxIds.SELECT    -> "Select"
+            PsxIds.START     -> "Start"
+            PsxIds.L3        -> "L3"
+            PsxIds.R3        -> "R3"
+            else             -> return null
         }
         val code = AndroidHostInterface.getControllerButtonCode(mControllerType, name)
         return if (code >= 0) code else null
