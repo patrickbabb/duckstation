@@ -14,8 +14,4 @@
 .cxx
 
 # Single-game local config
-android/app/local_game_config.properties
-android/app/src/main/java/com/github/stenzek/duckstation/LocalConfig.kt
-android/app/src/main/java/com/github/stenzek/duckstation/LocalPadConfig.kt
 android/app/src/main/res-local/
-src/core/local_settings.h
